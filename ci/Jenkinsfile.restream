@@ -1,0 +1,176 @@
+pipeline {
+    agent {
+        dockerfile {
+            filename 'ci/Dockerfile'
+            dir '.'
+            label 'csdac-prod'
+            registryUrl 'https://dockerhub.cisco.com'
+            registryCredentialsId 'cisco-dockerhub-id'
+            args '-u root'
+        }
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        ansiColor('xterm')
+    }
+    environment {
+        CLUSTERS =  'csdac-prodeu-cluster:eu-central-1,csdac-prodapj-cluster:ap-northeast-1,csdac-prodaus-cluster:ap-southeast-2,csdac-prodin-cluster:ap-south-1,csdac-prod-cluster:us-west-1'
+        AWS_CREDS = 'TERRAFORM_CSDAC_PROD'
+    }
+    parameters {
+        string(
+           name: 'TENANT_NAME',
+           defaultValue: "",
+           description: "This job will synchronize tenants that have differences with FMC. Please enter a list of tenants. Example: tenant1, tenant2, tenant3"
+        )
+        booleanParam(name: 'ACCEPT', defaultValue: false, description: 'Check this box to allow the pipeline to run')
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    sleep 1
+                }
+            }
+        }
+        stage('Check CREDS'){
+            steps{
+                script {
+                    CREDS_ID = "${env.AWS_CREDS}"
+                    println "Using AWS Credentials: ${CREDS_ID}"
+                }
+            }
+        }
+        stage('AWS CLI Check') {
+            steps {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                                                  credentialsId: CREDS_ID,
+                                                                  usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                                                  passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                    script{
+                        try {
+                            def clusterList = env.CLUSTERS.split(',')
+                            for (int i = 0; i < clusterList.size(); i++) {
+                                def clusterinfo = clusterList[i]
+                                def clustername = clusterinfo.split(':')[0]
+                                def region = clusterinfo.split(':')[1]
+                                echo "Region: ${region}"
+                                sh "aws sts get-caller-identity --region ${region}"
+                            }
+                        } catch (Exception e) {
+                            echo "Failed to get AWS caller identity: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            error("AWS CLI check failed.")
+                        }
+                    }
+                    }
+            }
+        }
+        stage('Process Clusters') {
+            when {
+                expression {
+                    return params.ACCEPT
+                }
+            }
+            steps {
+                script {
+                    def clusterList = env.CLUSTERS.split(',')
+                    for (int i = 0; i < clusterList.size(); i++) {
+                        def tenantList = params.TENANT_NAME
+                        def clusterinfo = clusterList[i]
+                        def clustername = clusterinfo.split(':')[0]
+                        def region = clusterinfo.split(':')[1]
+                                script {
+                                    echo "Processing cluster: ${clustername}"
+                                    echo "Region: ${region}"
+                                    stage("Restream tenants report for ${clustername}") {
+                                        dir('troubleshoot') {
+                                            withCredentials([usernamePassword(
+                                                                credentialsId: env.AWS_CREDS, 
+                                                                usernameVariable: 'AWS_ACCESS_KEY_ID', 
+                                                                passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                                script {
+                                                    try {
+                                                        sh "aws eks update-kubeconfig --region ${region} --name ${clustername}"
+                                                        sh "kubectl config current-context"
+                                                        sh """
+                                                        chmod +x cdcsdac-cli.sh
+                                                        ./cdcsdac-cli.sh restream-all-objects-for-tenants -t ${tenantList} >> Re-stream_report.txt 2>&1
+                                                        """
+                                                    } catch (Exception e) {
+                                                        echo "Failed to re-stream: ${e.getMessage()}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                    }
+                }
+            }
+        }
+        stage('Send notification') {
+            when {
+                expression {
+                    return params.ACCEPT
+                }
+            }
+            steps {
+                script {
+                  dir('troubleshoot') {
+                        try {
+                         def message = ""
+                         def file = "Re-stream_report.txt"
+                         def reportExists = fileExists 'Re-stream_report.txt'
+                         if (reportExists) {
+
+                             def reportContent = readFile(file)
+                             def unsynchronizedTenants = []
+                             def synchronizedTenants = []
+                             def sections = reportContent.split(/===================================================/)
+
+                             sections.each { section ->
+                                if (!section.contains("Restreaming is done for all objects.")) {
+                                    def matcher = section =~ /Tenant name:\s*(.*)/
+                                    if (matcher.find()) {
+                                        unsynchronizedTenants << matcher[0][1].trim()
+                                    }
+                                }
+                             }
+
+                              sections.each { section ->
+                                if (section.contains("Restreaming is done for all objects.")) {
+                                    def matcher = section =~ /Tenant name:\s*(.*)/
+                                    if (matcher.find()) {
+                                        synchronizedTenants << matcher[0][1].trim()
+                                    }
+                                }
+                             }
+                            if(!synchronizedTenants.isEmpty()){
+                                message += "Successfully synchronised tenants: ${synchronizedTenants.join(', ')}"
+                            }
+                            if(!unsynchronizedTenants.isEmpty()){
+                                message += "\nTenants with synchronisation issues: ${unsynchronizedTenants.join(', ')}"
+                            }
+                            echo message
+
+                            withCredentials([usernamePassword(credentialsId: 'webex_csdac-ops-prod', usernameVariable: 'room_id', passwordVariable: 'bot_token')]) {
+                                result = sh(returnStdout: true, script: "python3 ./send_report.py ${bot_token} ${room_id} '''${file}''' '''${message}''' ").trim()
+                            }
+                         }
+                        } catch (err) {
+                            echo "${err} Webex notify failed, moving on"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}

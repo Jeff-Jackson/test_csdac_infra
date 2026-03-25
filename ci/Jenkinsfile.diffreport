@@ -1,0 +1,158 @@
+pipeline {
+    agent {
+        dockerfile {
+            filename 'ci/Dockerfile'
+            dir '.'
+            label 'csdac-prod'
+            registryUrl 'https://dockerhub.cisco.com'
+            registryCredentialsId 'cisco-dockerhub-id'
+            args '-u root'
+        }
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        ansiColor('xterm')
+    }
+    triggers {
+        cron('0 10,17 * * *')
+    }
+    environment {
+        CLUSTERS =  'csdac-prodeu-cluster:eu-central-1,csdac-prodapj-cluster:ap-northeast-1,csdac-prodaus-cluster:ap-southeast-2,csdac-prodin-cluster:ap-south-1,csdac-prod-cluster:us-west-1'
+        AWS_CREDS = 'TERRAFORM_CSDAC_PROD'
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    sleep 1
+                }
+            }
+        }
+        stage('Check CREDS'){
+            steps{
+                script {
+                    CREDS_ID = "${env.AWS_CREDS}"
+                    println "Using AWS Credentials: ${CREDS_ID}"
+                }
+            }
+        }
+        stage('AWS CLI Check') {
+            steps {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                                                  credentialsId: CREDS_ID,
+                                                                  usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                                                  passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                    script{
+                        try {
+                            def clusterList = env.CLUSTERS.split(',')
+                            for (int i = 0; i < clusterList.size(); i++) {
+                                def clusterinfo = clusterList[i]
+                                def clustername = clusterinfo.split(':')[0]
+                                def region = clusterinfo.split(':')[1]
+                                echo "Region: ${region}"
+                                sh "aws sts get-caller-identity --region ${region}"
+                            }
+                        } catch (Exception e) {
+                            echo "Failed to get AWS caller identity: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            error("AWS CLI check failed.")
+                        }
+                    }
+                    }
+            }
+        }
+        stage('Process Clusters') {
+            steps {
+                script {
+                    def clusterList = env.CLUSTERS.split(',')
+                    for (int i = 0; i < clusterList.size(); i++) {
+                        def clusterinfo = clusterList[i]
+                        def clustername = clusterinfo.split(':')[0]
+                        def region = clusterinfo.split(':')[1]
+                                script {
+                                    echo "Processing cluster: ${clustername}"
+                                    echo "Region: ${region}"
+                                    stage("Generate report for ${clustername}") {
+                                        dir('troubleshoot') {
+                                            withCredentials([usernamePassword(credentialsId: env.AWS_CREDS, usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                                script {
+                                                    try {
+                                                        sh "aws eks update-kubeconfig --region ${region} --name ${clustername}"
+                                                        sh "kubectl config current-context"
+                                                        sh "echo Diff info from ${clustername} >> diff_report.txt"
+                                                        sh '''
+                                                            chmod +x cdcsdac-cli.sh
+                                                            ./cdcsdac-cli.sh get-diff-paying-tenants >> diff_report.txt 2>&1
+                                                        '''
+                                                    } catch (Exception e) {
+                                                        echo "Failed to generate report: ${e.getMessage()}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                    }
+                }
+            }
+        }
+        stage('Send notification') {
+            steps {
+                script {
+                  dir('troubleshoot') {
+                        try {
+                         def message = ""
+                         def tp_message = ""
+                         def file = "diff_report.txt"
+                         def diffReportExists = fileExists 'diff_report.txt'
+                             if (diffReportExists) {
+                                    def fileContent = readFile('diff_report.txt')
+                                    def sections = fileContent.split(/===================================================/)
+
+                                    def notInSyncTenants = []
+
+                                sections.each { section ->
+                                    def syncStatusMatch = (section =~ /Objects are NOT in sync with FMC/)
+        
+                                    if (syncStatusMatch) {
+                                        def tenantNameMatch = (section =~ /Tenant name:\s*(.*)/)
+                                        if (tenantNameMatch) {
+                                            def tenantNames = tenantNameMatch.collect { it[1].trim() }
+                                            def tenantName = tenantNames.last()
+                                            notInSyncTenants.add(tenantName)
+                                        }
+                                    }
+                                }
+
+                                if (notInSyncTenants.isEmpty()) {
+                                    message+= "All tenants are in sync with FMC.\n"
+                                    echo message
+                                } else {
+                                    tp_message+= "<strong>Tenants with objects not in sync: </strong><br>${notInSyncTenants.join(', ')}  <br><br><strong>Objects re-stream can be executed using the next Jenkins job:</strong><br>https://engci-private-rtp.cisco.com/jenkins/fp-components/job/CSDAC/job/CSDAC_Restricted/job/Re-stream%20all%20objects%20for%20tenants/ <br>"
+                                    message+= "Tenants with objects not in sync: ${notInSyncTenants.join(', ')}\n\nObjects re-stream can be executed using the next Jenkins job:\nhttps://engci-private-rtp.cisco.com/jenkins/fp-components/job/CSDAC/job/CSDAC_Restricted/job/Re-stream%20all%20objects%20for%20tenants/ \n"
+                                    withCredentials([string(credentialsId: 'csdac_tp', variable: 'token')])  {
+                                        result = sh(returnStdout: true, script: "python3 create_tp_bug.py ${token} '''${tp_message}''' '''${file}''' ").trim()
+                                        message += result
+                                    }
+                                    echo message
+                                }
+                             }
+                                      withCredentials([usernamePassword(credentialsId: 'webex_csdac-ops-prod', usernameVariable: 'room_id', passwordVariable: 'bot_token')]) {
+                                      result = sh(returnStdout: true, script: "python3 ./send_report.py ${bot_token} ${room_id} '''${file}''' '''${message}''' ").trim()
+                                  }
+                            } catch (err) {
+                                echo "${err} Webex notify failed, moving on"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}

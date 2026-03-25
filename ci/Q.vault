@@ -1,0 +1,940 @@
+pipeline {
+    agent {
+        dockerfile {
+            filename 'ci/Dockerfile'
+            dir '.'
+            label 'csdac-prod'
+            registryUrl 'https://dockerhub.cisco.com'
+            registryCredentialsId 'cisco-dockerhub-id'
+        }
+    }
+    environment {
+        HOME = "${env.WORKSPACE}"
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        timeout(time: 1, unit: 'HOURS')
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: 'dev\nqa\nci\nstaging\nprod\nprodeu\nprodapj\nprodaus\nprodin\nproduae',
+            description: 'Target environment. Region & AWS credentials are derived automatically.'
+        )
+        string(
+            name: 'EKS_CLUSTER_NAME',
+            defaultValue: '',
+            description: 'Optional override. If empty, cluster name defaults to csdac-${ENVIRONMENT}-cluster.'
+        )
+        string(
+            name: 'AWS_REGION',
+            defaultValue: '',
+            description: 'Optional override. If empty, region is derived from ENVIRONMENT.'
+        )
+        string(
+            name: 'AWS_CREDENTIALS',
+            defaultValue: '',
+            description: 'Optional override. If empty, credentials are derived from ENVIRONMENT.'
+        )
+        choice(
+                name: 'ACTION',
+                choices: ["apply", "plan", "destroy"],
+                description: "Terraform action, Apply/Plan/Destroy"
+        )
+        booleanParam(
+                name: 'TF_RUN',
+                defaultValue: false,
+                description: 'Apply Terraform if selected'
+        )
+        booleanParam(
+                name: 'VAULT_OPERATOR_INIT',
+                defaultValue: false,
+                description: 'Vault first time operator init (vault operator init -tls-skip-verify)'
+        )
+        string(
+                name: 'VAULT_INIT_CONFIRM',
+                defaultValue: "",
+                description: "Hard-confirm for VAULT_OPERATOR_INIT. Type: I_UNDERSTAND_THIS_WILL_INITIALIZE_VAULT"
+        )
+        booleanParam(
+                name: 'VAULT_UPDATE_TLS_CERT',
+                defaultValue: false,
+                description: 'Update tls cert for Vault (automatically backs up current cert before update)'
+        )
+        booleanParam(
+                name: 'ROLLBACK_TLS_CERT',
+                defaultValue: false,
+                description: 'Rollback to previous TLS certificate from backup (use if update failed)'
+        )
+        booleanParam(
+                name: 'VAULT_CONFIGURE',
+                defaultValue: false,
+                description: 'Vault configure or reconfigure'
+        )
+        string(
+                name: 'VAULT_AWS_IAM_ACCOUNT_ID',
+                defaultValue: '',
+                description: 'Optional override. AWS account ID used in vault_configure.sh for IAM role bindings (Lambda-CDO-<env>-role).'
+        )
+        string(
+                name: 'VAULT_AWS_IAM_ROLE_SUFFIX',
+                defaultValue: '',
+                description: 'Optional override. Suffix for IAM roles bound in Vault AWS auth (Lambda-CDO-<suffix>-role). If empty, defaults to ENVIRONMENT.'
+        )
+        booleanParam(
+                name: 'AWS_SM',
+                defaultValue: false,
+                description: 'Read Vault root token from AWS Secrets Manager. (VAULT_ROOT_TOKEN option will be ignored)'
+        )
+        string(
+                name: 'VAULT_ROOT_TOKEN',
+                defaultValue: "",
+                description: "Vault Initial Root Token"
+        )
+        booleanParam(
+                name: 'TF_IMPORT_EXISTING_OIDC_PROVIDER',
+                defaultValue: true,
+                description: 'If an IAM OIDC provider for the EKS cluster already exists (created manually), import it into Terraform state to avoid EntityAlreadyExists errors.'
+        )
+    }
+
+    stages {
+        stage('Resolve AWS context') {
+            steps {
+                script {
+                    def envName = (params.ENVIRONMENT ?: '').trim().toLowerCase()
+
+                    def envToRegion = [
+                        'dev'     : 'us-west-1',
+                        'qa'      : 'us-west-1',
+                        'ci'      : 'us-west-1',
+                        'staging' : 'us-west-1',
+
+                        'prod'    : 'us-west-1',
+                        'prodeu'  : 'eu-central-1',
+                        'prodapj' : 'ap-northeast-1',
+                        'prodaus' : 'ap-southeast-2',
+                        'prodin'  : 'ap-south-1',
+                        'produae' : 'me-central-1',
+                    ]
+
+                    def isFed  = envName.contains('fed')
+                    def isProd = ['prod','prodeu','prodapj','prodaus','prodin','produae'].contains(envName)
+
+                    def defaultCreds = isFed ? 'AWS_GOV_CLOUD_CSDAC'
+                                             : (isProd ? 'TERRAFORM_CSDAC_PROD' : 'TERRAFORM_CSDAC')
+
+                    // Region: allow explicit override via parameter, otherwise derive from environment map
+                    env.AWS_REGION_EFFECTIVE = (params.AWS_REGION?.trim())
+                        ? params.AWS_REGION.trim()
+                        : (envToRegion[envName] ?: 'us-west-1')
+
+                    // Creds: allow explicit override via parameter, otherwise derive from env boundary
+                    env.CREDS_ID_EFFECTIVE = (params.AWS_CREDENTIALS?.trim())
+                        ? params.AWS_CREDENTIALS.trim()
+                        : defaultCreds
+
+                    // EKS cluster name: allow explicit override via parameter, otherwise default to the historical naming convention
+                    env.EKS_CLUSTER_NAME_EFFECTIVE = (params.EKS_CLUSTER_NAME?.trim())
+                        ? params.EKS_CLUSTER_NAME.trim()
+                        : "csdac-${params.ENVIRONMENT}-cluster"
+
+                    // Backward compatible variable used later in the pipeline
+                    CREDS_ID = env.CREDS_ID_EFFECTIVE
+
+                    // Ensure this is always defined even if we fail before the tfvars stage
+                    tffile = "${params.ENVIRONMENT}.tfvar.json"
+
+                    echo "Resolved AWS context: ENV=${params.ENVIRONMENT} REGION=${env.AWS_REGION_EFFECTIVE} CREDS=${env.CREDS_ID_EFFECTIVE} EKS_CLUSTER=${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                }
+            }
+        }
+
+        stage('Terraform init S3 backend') {
+            when {
+                expression {
+                    params.TF_RUN == true
+                }
+            }
+            steps {
+                script {
+                    println "Using a AWS Credentials: ${CREDS_ID}"
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh "aws sts get-caller-identity"
+                      }
+                    }
+                }
+                dir('terraform/vault'){
+                    script {
+                      // S3 backend region must match the bucket region, not the EKS region.
+                      // In this account the terraform-state-csdac-tspace bucket is in us-gov-west-1.
+                      def backendRegion = env.AWS_REGION_EFFECTIVE
+                      if (env.AWS_REGION_EFFECTIVE == "us-gov-west-1" || env.AWS_REGION_EFFECTIVE == "us-gov-east-1"){
+                        backendRegion = "us-gov-west-1"
+                        sh '''
+                            sed -i \'s/^\\(\\s*region\\s*=\\s*\\).*$/\\1"''' + backendRegion + '''"/\' backend.tf
+                            cat backend.tf
+                        '''
+                      }
+                    }
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh "terraform init -backend-config=\"key=terraform/vault-${params.ENVIRONMENT}/terraform.tfstate\""
+                        sh "aws eks update-kubeconfig --region ${env.AWS_REGION_EFFECTIVE} --name ${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                        sh "kubectl get pods -n vault"
+                      }
+                    }
+                }
+            }
+        }
+
+        stage('Import existing EKS OIDC provider (optional)') {
+            when {
+                expression { params.TF_RUN == true && params.TF_IMPORT_EXISTING_OIDC_PROVIDER == true }
+            }
+            steps {
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      // Shell step expects these names; make them explicit to avoid empty vars
+                      "AWS_REGION_EFFECTIVE=${env.AWS_REGION_EFFECTIVE}",
+                      "ENVIRONMENT=${params.ENVIRONMENT}",
+                      "EKS_CLUSTER_NAME=${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+set -eu
+
+echo "[oidc-import] Preparing minimal tfvars for Terraform commands (avoids missing required variable errors)..."
+
+# Terraform evaluates the configuration even for state/import commands.
+# Provide required root variables via a small generated tfvars file.
+tfvars_file="/tmp/oidc-import-${ENVIRONMENT}.tfvars.json"
+
+# Derive the ARN partition used by this codebase (commercial vs GovCloud)
+arn_name="aws"
+if [ "${AWS_REGION}" = "us-gov-west-1" ] || [ "${AWS_REGION}" = "us-gov-east-1" ]; then
+  arn_name="aws-us-gov"
+fi
+
+# Ensure kubeconfig is set before reading kubectl context/CA
+aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}" >/dev/null
+
+kubectl_ctx="$(kubectl config current-context)"
+kubectl_ca="$(kubectl config view --minify --raw --output 'jsonpath={..cluster.certificate-authority-data}')"
+
+cat > "${tfvars_file}" <<EOF
+{
+  "region": "${AWS_REGION}",
+  "env": "${ENVIRONMENT}",
+  "eks_cluster_name": "${EKS_CLUSTER_NAME}",
+  "kubectl_ctx": "${kubectl_ctx}",
+  "kubectl_CA": "${kubectl_ca}",
+  "arn": "${arn_name}"
+}
+EOF
+
+echo "[oidc-import] Checking whether aws_iam_openid_connect_provider.eks is already in Terraform state..."
+if terraform state show -var-file="${tfvars_file}" aws_iam_openid_connect_provider.eks >/dev/null 2>&1; then
+  echo "[oidc-import] OIDC provider is already managed in Terraform state. Skipping import."
+  exit 0
+fi
+
+# Discover the cluster's OIDC issuer (must include https:// prefix)
+set +u
+issuer_raw="$(aws eks describe-cluster \
+  --name "${EKS_CLUSTER_NAME}" \
+  --region ${AWS_REGION} \
+  --query 'cluster.identity.oidc.issuer' \
+  --output text 2>/dev/null)"
+aws_exit=$?
+set -u
+
+issuer=""
+if [ "${aws_exit}" -eq 0 ]; then
+  issuer="${issuer_raw:-}"
+fi
+
+if [ -z "${issuer:-}" ] || [ "${issuer}" = "None" ]; then
+  echo "[oidc-import] WARN: Cluster does not report an OIDC issuer yet (issuer='${issuer}'). Skipping import."
+  exit 0
+fi
+
+echo "[oidc-import] Cluster OIDC issuer: ${issuer}"
+
+# Find an existing IAM OIDC provider ARN that matches the issuer URL
+provider_arn="$(aws iam list-open-id-connect-providers \
+  --query 'OpenIDConnectProviderList[*].Arn' \
+  --output text \
+  | tr '\t' '\n' \
+  | while read -r arn; do
+      [ -z "$arn" ] && continue
+      url="$(aws iam get-open-id-connect-provider \
+        --open-id-connect-provider-arn "$arn" \
+        --query 'Url' \
+        --output text 2>/dev/null || true)"
+      # The IAM API returns Url without https://, so normalize before comparing
+      if [ "https://${url}" = "${issuer}" ]; then
+        echo "$arn"
+        break
+      fi
+    done)"
+
+if [ -z "${provider_arn}" ]; then
+  echo "[oidc-import] No matching IAM OIDC provider found for issuer ${issuer}. Nothing to import."
+  exit 0
+fi
+
+echo "[oidc-import] Found matching IAM OIDC provider ARN: ${provider_arn}"
+echo "[oidc-import] Importing into Terraform state as aws_iam_openid_connect_provider.eks ..."
+terraform import -input=false -var-file="${tfvars_file}" aws_iam_openid_connect_provider.eks "${provider_arn}"
+echo "[oidc-import] Import completed."
+'''
+                      }
+                    }
+                }
+            }
+        }
+
+        stage('Terraform tfvar provide') {
+            when {
+                expression {
+                    params.TF_RUN == true
+                }
+            }
+            steps {
+                dir('terraform/vault'){
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            if (env.AWS_REGION_EFFECTIVE == "us-gov-west-1" || env.AWS_REGION_EFFECTIVE == "us-gov-east-1"){
+                              arn_name = "aws-us-gov"
+                            } else {
+                              arn_name = "aws"
+                            }
+
+                            tffile = "${params.ENVIRONMENT}.tfvar.json"
+                            TF_VAR_region = "${env.AWS_REGION_EFFECTIVE}".toString()
+                            TF_VAR_env = "${params.ENVIRONMENT}".toString()
+                            TF_VAR_kubectl_ctx = sh(script: "kubectl config current-context", returnStdout: true).trim()
+                            TF_VAR_kubectl_CA = sh(script: "kubectl config view --minify --raw --output 'jsonpath={..cluster.certificate-authority-data}'", returnStdout: true).trim()
+                            TF_VAR_arn = "${arn_name}".toString()
+                            tfdata = readJSON text: '{}'
+                            tfdata.region = TF_VAR_region
+                            tfdata.env = TF_VAR_env
+                            tfdata.eks_cluster_name = "${env.EKS_CLUSTER_NAME_EFFECTIVE}".toString()
+                            tfdata.kubectl_ctx = TF_VAR_kubectl_ctx
+                            tfdata.kubectl_CA = TF_VAR_kubectl_CA
+                            tfdata.arn = TF_VAR_arn
+                        }
+                        writeJSON(file: tffile, json: tfdata, pretty: 4)
+                      }
+                    }
+                }
+            }
+        }
+        stage('Terraform Plan') {
+            when {
+                expression {
+                    params.ACTION != "destroy" && params.TF_RUN == true
+                }
+            }
+            steps {
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                          sh "terraform plan -var-file=${tffile}"
+                      }
+                    }
+                }
+            }
+        }
+        stage("Backup current TLS cert before update") {
+            when {
+                expression {
+                    params.TF_RUN == true && params.VAULT_UPDATE_TLS_CERT == true
+                }
+            }
+            steps {
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            def secretName = "vault-tls-backup-${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                            echo "Backing up current TLS certificate to AWS Secrets Manager: ${secretName}"
+
+                            // Get current TLS secret from Kubernetes
+                            sh """
+                                kubectl get secret vault-server-tls -n vault -o json > /tmp/vault-tls-backup.json || true
+                                if [ -s /tmp/vault-tls-backup.json ]; then
+                                    # Create or update backup in AWS Secrets Manager
+                                    aws secretsmanager create-secret --name ${secretName} --secret-string file:///tmp/vault-tls-backup.json --region ${env.AWS_REGION_EFFECTIVE} 2>/dev/null || \
+                                    aws secretsmanager put-secret-value --secret-id ${secretName} --secret-string file:///tmp/vault-tls-backup.json --region ${env.AWS_REGION_EFFECTIVE}
+                                    echo "TLS certificate backup saved to AWS Secrets Manager: ${secretName}"
+                                else
+                                    echo "WARNING: Could not retrieve current TLS secret. Proceeding without backup."
+                                fi
+                                rm -f /tmp/vault-tls-backup.json
+                            """
+                        }
+                      }
+                    }
+                }
+            }
+        }
+        stage("Remove old state for tls cert") {
+            when {
+                expression {
+                    params.TF_RUN == true && params.VAULT_UPDATE_TLS_CERT == true
+                }
+            }
+            steps {
+                timeout(time: 10, unit: "MINUTES") {
+                    input message: "Approve removing kubernetes_certificate_signing_request_v1.vault state for ${params.ENVIRONMENT}?", ok: "Yes"
+                }
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                          sh "terraform taint kubernetes_certificate_signing_request_v1.vault"
+                      }
+                    }
+                }
+            }
+        }
+        stage("Rollback TLS cert from backup") {
+            when {
+                expression {
+                    params.ROLLBACK_TLS_CERT == true
+                }
+            }
+            steps {
+                timeout(time: 10, unit: "MINUTES") {
+                    input message: "Approve TLS certificate rollback for ${params.ENVIRONMENT}? This will restore the previous certificate from backup.", ok: "Yes"
+                }
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            def secretName = "vault-tls-backup-${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                            def legacySecretName = "vault-tls-backup-csdac-${params.ENVIRONMENT}"
+
+                            // Initialize terraform to access state
+                            sh "terraform init -backend-config=\"key=terraform/vault-${params.ENVIRONMENT}/terraform.tfstate\""
+
+                            sh """
+                                aws eks update-kubeconfig --region ${env.AWS_REGION_EFFECTIVE} --name ${env.EKS_CLUSTER_NAME_EFFECTIVE}
+
+                                echo "Retrieving TLS certificate backup from AWS Secrets Manager: ${secretName} (fallback: ${legacySecretName})"
+
+                                if aws secretsmanager get-secret-value --secret-id ${secretName} --region ${env.AWS_REGION_EFFECTIVE} --query SecretString --output text > /tmp/vault-tls-restore.json 2>/dev/null; then
+                                    echo "Using TLS backup secret: ${secretName}"
+                                else
+                                    echo "WARN: TLS backup secret not found: ${secretName}. Falling back to legacy secret: ${legacySecretName}"
+                                    aws secretsmanager get-secret-value --secret-id ${legacySecretName} --region ${env.AWS_REGION_EFFECTIVE} --query SecretString --output text > /tmp/vault-tls-restore.json
+                                    echo "Using TLS backup secret: ${legacySecretName}"
+                                fi
+
+                                if [ -s /tmp/vault-tls-restore.json ]; then
+                                    echo "Deleting current TLS secret..."
+                                    kubectl delete secret vault-server-tls -n vault --ignore-not-found
+
+                                    echo "Restoring TLS secret from backup..."
+                                    kubectl apply -f /tmp/vault-tls-restore.json
+
+                                    echo "Removing TLS resources from terraform state to prevent overwrite..."
+                                    terraform state rm kubernetes_secret.vault || true
+                                    terraform state rm kubernetes_certificate_signing_request_v1.vault || true
+                                    terraform state rm tls_cert_request.vault || true
+                                    terraform state rm tls_private_key.vault || true
+
+                                    echo "Restarting vault pods to apply restored certificate..."
+                                    for pod in vault-0 vault-1 vault-2; do
+                                        kubectl -n vault delete pod \${pod} --wait=false || true
+                                    done
+
+                                    echo "Waiting for vault pods to be ready..."
+                                    kubectl -n vault wait --for=condition=Ready pod/vault-0 --timeout=5m || true
+
+                                    echo "TLS certificate rollback completed successfully!"
+                                    echo "WARNING: TLS resources removed from terraform state."
+                                    echo "Next 'terraform apply' will recreate TLS cert."
+
+                                    # Verify vault is responding
+                                    sleep 10
+                                    kubectl exec vault-0 -n vault -- vault status -tls-skip-verify || echo "Note: Vault may need to be unsealed"
+                                else
+                                    echo "ERROR: Could not retrieve TLS backup from Secrets Manager"
+                                    exit 1
+                                fi
+                                rm -f /tmp/vault-tls-restore.json
+                            """
+                        }
+                      }
+                    }
+                }
+            }
+        }
+        stage("Terraform Action") {
+            when {
+                expression {
+                    params.TF_RUN == true && params.ACTION != "plan"
+                }
+            }
+            steps {
+                timeout(time: 10, unit: "MINUTES") {
+                    input message: "Approve ${params.ACTION} for ${params.ENVIRONMENT}?", ok: "Yes"
+                }
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            if (params.ACTION == "apply") {
+                                sh "terraform ${params.ACTION} -var-file=${tffile} -auto-approve -input=false"
+                            } else if (params.ACTION == "destroy") {
+                                // Always exclude DynamoDB, KMS seal key, and backup resources from destroy
+                                // These resources are critical for vault data access and must be preserved
+                                def stateList = sh(script: "terraform state list", returnStdout: true).trim()
+                                def resources = stateList.split('\n').findAll { resource ->
+                                    !resource.contains('aws_dynamodb_table') &&
+                                    !resource.contains('aws_kms_key.vault') &&
+                                    !resource.contains('aws_backup_vault') &&
+                                    !resource.contains('aws_backup_plan') &&
+                                    !resource.contains('aws_backup_selection') &&
+                                    !resource.contains('aws_kms_key.vaultdb') &&
+                                    !resource.contains('aws_kms_alias.vaultdb') &&
+                                    !resource.contains('aws_iam_role.vaulddb')
+                                }
+                                def targetExclude = ""
+                                if (resources) {
+                                    targetExclude = resources.collect { "-target='${it}'" }.join(' ')
+                                    echo "Excluding DynamoDB, KMS seal key, and backup resources from destroy."
+                                    echo "Preserved resources ensure vault data remains accessible after re-deployment."
+                                    echo "Targeting ${resources.size()} resources for destroy."
+                                }
+                                sh "terraform destroy -var-file=${tffile} -auto-approve -input=false ${targetExclude}"
+                            } else {
+                                error("Terraform Action stage should not run for ACTION=plan")
+                            }
+                        }
+                        script {
+                            if (params.ACTION == "apply") {
+                                // Post-apply reconciliation: Vault uses updateStrategyType=OnDelete, so pods will NOT restart automatically.
+                                // We must do a controlled restart to make IRSA env/token take effect.
+                                sh "aws eks update-kubeconfig --region ${env.AWS_REGION_EFFECTIVE} --name ${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+
+                                // Sanity check: ensure IRSA role annotation is present on the Vault serviceaccount
+                                sh '''
+                                  set -eu
+
+                                  # Prefer JSON + jq (avoids jsonpath escaping issues)
+                                  if command -v jq >/dev/null 2>&1; then
+                                    # Read role-arn into a variable first (prevents ugly `emptytee` log merging)
+                                    role_arn="$(kubectl -n vault get sa vault-server-sa -o json \
+                                      | jq -r '.metadata.annotations["eks.amazonaws.com/role-arn"] // empty')"
+
+                                    # Write exactly what we got to the file (empty -> empty file)
+                                    if [ -n "$role_arn" ]; then
+                                      printf '%s\n' "$role_arn" | tee /tmp/vault_sa_role_arn.txt
+                                    else
+                                      : > /tmp/vault_sa_role_arn.txt
+                                    fi
+                                  else
+                                    # Fallback: parse from YAML (best-effort)
+                                    kubectl -n vault get sa vault-server-sa -o yaml \
+                                      | awk -F': ' '/^[[:space:]]*eks.amazonaws.com\\/role-arn:/ {print $2}' \
+                                      | tr -d '\r' \
+                                      | tee /tmp/vault_sa_role_arn.txt
+                                  fi
+
+                                  if [ ! -s /tmp/vault_sa_role_arn.txt ]; then
+                                    echo 'ERROR: vault-server-sa is missing eks.amazonaws.com/role-arn annotation (IRSA not enabled)'
+                                    kubectl -n vault get sa vault-server-sa -o yaml || true
+                                    exit 1
+                                  fi
+
+                                  echo "INFO: vault-server-sa IRSA role-arn: $(cat /tmp/vault_sa_role_arn.txt)"
+                                '''
+
+                                // Controlled restart (one-by-one) to avoid HA disruption. This also fixes CrashLoopBackOff caused by missing IAM.
+                                sh '''
+                                  set -eu
+
+                                  echo "================ VAULT CONTROLLED RESTART (IRSA APPLY) ================"
+                                  kubectl -n vault get pods -o wide || true
+                                  echo "[IRSA] Starting Vault pod restarts (vault-0..vault-2)"
+
+                                  failures=0
+                                  failed_pods=""
+
+                                  # Restart helper: StatefulSet pod name is stable, so we must ensure we are talking to the *new* pod instance.
+                                  # We do that by watching UID change after delete, then waiting for Ready.
+                                  wait_for_new_pod_uid() {
+                                    pod="$1"
+                                    old_uid="$2"
+
+                                    echo "[IRSA] Waiting for ${pod} to be recreated with a new UID..."
+                                    i=0
+                                    while [ $i -lt 900 ]; do
+                                      # If pod doesn't exist yet, keep waiting
+                                      if ! kubectl -n vault get pod "${pod}" >/dev/null 2>&1; then
+                                        i=$((i+1))
+                                        sleep 1
+                                        continue
+                                      fi
+
+                                      new_uid="$(kubectl -n vault get pod "${pod}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+                                      phase="$(kubectl -n vault get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+
+                                      # UID must be non-empty and different from old one (if we had old)
+                                      if [ -n "${new_uid}" ] && { [ -z "${old_uid}" ] || [ "${new_uid}" != "${old_uid}" ]; }; then
+                                        echo "[IRSA] ${pod} UID is now ${new_uid} (phase=${phase})"
+                                        return 0
+                                      fi
+
+                                      i=$((i+1))
+                                      sleep 1
+                                    done
+
+                                    echo "ERROR: timeout waiting for ${pod} to get a new UID"
+                                    return 1
+                                  }
+
+                                  wait_for_vault_container_ready() {
+                                    pod="$1"
+                                    echo "[IRSA] Waiting for ${pod} to become Ready..."
+                                    if ! kubectl -n vault wait --for=condition=Ready pod/"${pod}" --timeout=15m; then
+                                      echo "ERROR: ${pod} did not become Ready"
+                                      return 1
+                                    fi
+
+                                    # Extra guardrail: ensure the vault container readiness flag is true (exec races happen otherwise)
+                                    i=0
+                                    while [ $i -lt 300 ]; do
+                                      ready="$(kubectl -n vault get pod "${pod}" -o jsonpath='{.status.containerStatuses[?(@.name=="vault")].ready}' 2>/dev/null || true)"
+                                      if [ "${ready}" = "true" ]; then
+                                        return 0
+                                      fi
+                                      i=$((i+1))
+                                      sleep 1
+                                    done
+
+                                    echo "ERROR: ${pod} vault container did not become ready in time"
+                                    return 1
+                                  }
+
+                                  check_irsa_token_via_exec() {
+                                    pod="$1"
+                                    tmpfile="/tmp/${pod}_irsa_env.txt"
+                                    : > "${tmpfile}"
+
+                                    # `kubectl exec` can be flaky right after restarts (old pod instance, CNI not ready, etc.).
+                                    # Retry on known transient errors.
+                                    attempt=1
+                                    max_attempts=20
+                                    while [ $attempt -le $max_attempts ]; do
+                                      echo "[IRSA] exec attempt ${attempt}/${max_attempts} for ${pod}"
+
+                                      out="$(kubectl -n vault exec "${pod}" -- sh -lc '
+                                        set -eu
+                                        echo "[IRSA] env:"
+                                        env | egrep "AWS_ROLE_ARN|AWS_WEB_IDENTITY_TOKEN_FILE" || true
+
+                                        echo "[IRSA] token file:"
+                                        token="/var/run/secrets/eks.amazonaws.com/serviceaccount/token"
+
+                                        # The projected token can appear slightly after container start
+                                        i=0
+                                        while [ $i -lt 30 ]; do
+                                          if [ -f "$token" ]; then
+                                            ls -l /var/run/secrets/eks.amazonaws.com/serviceaccount/ || true
+                                            head -c 20 "$token" >/dev/null 2>&1 || true
+                                            echo OK_TOKEN
+                                            exit 0
+                                          fi
+                                          i=$((i+1))
+                                          sleep 1
+                                        done
+
+                                        echo MISSING_TOKEN
+                                        exit 0
+                                      ' 2>&1)"
+                                      rc=$?
+
+                                      printf '%s\n' "$out" | tee -a "${tmpfile}"
+
+                                      # Success path
+                                      if [ $rc -eq 0 ]; then
+                                        break
+                                      fi
+
+                                      # Transient errors we should retry
+                                      if [ $rc -eq 137 ] || printf '%s' "$out" | egrep -qi 'cannot exec in a deleted state|completed pod|pod .* not found|container.*not found|error executing command in container|unable to upgrade connection|timeout'; then
+                                        sleep 3
+                                        attempt=$((attempt+1))
+                                        continue
+                                      fi
+
+                                      # Non-transient exec failure
+                                      break
+                                    done
+
+                                    if ! grep -q 'OK_TOKEN' "${tmpfile}"; then
+                                      echo "ERROR: ${pod} does not have the projected web identity token file; IRSA not in effect"
+                                      return 1
+                                    fi
+
+                                    return 0
+                                  }
+
+                                  for pod in vault-0 vault-1 vault-2; do
+                                    echo "--- Restarting ${pod} ---"
+
+                                    # Up to 2 attempts per pod (handles transient aws-cni IP assignment failures)
+                                    pod_ok=0
+                                    restart_try=1
+                                    while [ $restart_try -le 2 ]; do
+                                      echo "[IRSA] ${pod}: restart attempt ${restart_try}/2"
+
+                                      old_uid="$(kubectl -n vault get pod "${pod}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+                                      kubectl -n vault delete pod "${pod}" --wait=false || true
+
+                                      if ! wait_for_new_pod_uid "${pod}" "${old_uid}"; then
+                                        restart_try=$((restart_try+1))
+                                        continue
+                                      fi
+
+                                      # If pod scheduling/CNI is under pressure, Ready wait may fail once. We'll capture diagnostics and retry.
+                                      if ! wait_for_vault_container_ready "${pod}"; then
+                                        echo "[IRSA] Diagnostics for ${pod} (Ready wait failed):"
+                                        kubectl -n vault get pods -o wide || true
+                                        kubectl -n vault describe pod "${pod}" || true
+                                        # NOTE: --previous can legitimately fail when there was no previous container; don't treat as a signal.
+                                        kubectl -n vault logs "${pod}" --all-containers --previous || true
+                                        kubectl -n vault logs "${pod}" --all-containers || true
+
+                                        # One quick hint if it's the classic AWS CNI IP assignment issue
+                                        if kubectl -n vault describe pod "${pod}" 2>/dev/null | egrep -qi 'aws-cni|FailedCreatePodSandBox|failed to assign an IP address'; then
+                                          echo "[IRSA] Detected CNI/IP assignment issue for ${pod}. Retrying restart once..."
+                                        fi
+
+                                        restart_try=$((restart_try+1))
+                                        sleep 5
+                                        continue
+                                      fi
+
+                                      echo "--- IRSA / web-identity check for ${pod} ---"
+                                      if ! check_irsa_token_via_exec "${pod}"; then
+                                        echo "[IRSA] Diagnostics for ${pod} (IRSA token check failed):"
+                                        kubectl -n vault get sa vault-server-sa -o yaml || true
+                                        kubectl -n vault describe pod "${pod}" || true
+                                        kubectl -n vault logs "${pod}" --all-containers --previous || true
+                                        kubectl -n vault logs "${pod}" --all-containers || true
+
+                                        restart_try=$((restart_try+1))
+                                        sleep 5
+                                        continue
+                                      fi
+
+                                      echo "--- Vault status for ${pod} ---"
+                                      # Vault can refuse connections briefly even after Ready; keep non-fatal.
+                                      kubectl -n vault exec "${pod}" -- vault status -tls-skip-verify || true
+
+                                      echo "--- ${pod} restart + IRSA check OK ---"
+                                      pod_ok=1
+                                      break
+                                    done
+
+                                    if [ $pod_ok -ne 1 ]; then
+                                      echo "ERROR: ${pod} failed controlled restart/IRSA verification"
+                                      failures=$((failures+1))
+                                      failed_pods="${failed_pods} ${pod}"
+                                    fi
+
+                                  done
+
+                                  echo "================ VAULT CONTROLLED RESTART SUMMARY ================"
+                                  kubectl -n vault get pods -o wide || true
+
+                                  if [ $failures -ne 0 ]; then
+                                    echo "ERROR: controlled restart had failures for:${failed_pods}"
+                                    exit 1
+                                  fi
+
+                                  echo "SUCCESS: all Vault pods restarted and IRSA token present (vault-0..vault-2)"
+                                '''
+                            }
+                        }
+                    }
+                    }
+                }
+            }
+        }
+        stage("Vault init") {
+            when {
+                expression {
+                    params.VAULT_OPERATOR_INIT == true
+                }
+            }
+            steps {
+                dir('terraform/vault') {
+                    script {
+                        if (params.VAULT_OPERATOR_INIT == true && params.VAULT_INIT_CONFIRM != 'I_UNDERSTAND_THIS_WILL_INITIALIZE_VAULT') {
+                            error("Hard-confirm failed: To run VAULT_OPERATOR_INIT you must set VAULT_INIT_CONFIRM=I_UNDERSTAND_THIS_WILL_INITIALIZE_VAULT")
+                        }
+                    }
+
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            println "Using AWS Credentials: ${CREDS_ID}"
+                            VAULT_SECRET_VAR_NAME = "vault-${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                        }
+                        sh "aws eks update-kubeconfig --region ${env.AWS_REGION_EFFECTIVE} --name ${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                        sh "kubectl -n vault wait --for=condition=Ready pod/vault-0 --timeout=10m"
+                        // Guardrail: do NOT allow init if Vault is already initialized
+                        sh '''
+                          set -eu
+                          status_out="$(kubectl -n vault exec vault-0 -- vault status -tls-skip-verify || true)"
+                          echo "================ VAULT STATUS CHECK (pre-init) ================"
+                          echo "$status_out"
+                          echo "================================================================"
+
+                          # If Vault is already initialized, block the init stage immediately
+                          if echo "$status_out" | awk 'BEGIN{found=0} $1=="Initialized"{found=1; if($2=="true") exit 0; else exit 1} END{if(found==0) exit 2}'; then
+                            echo "ERROR: Vault is already initialized. Refusing to run 'vault operator init'."
+                            exit 1
+                          fi
+                        '''
+                        sh "kubectl exec vault-0 -n vault -- vault operator init -tls-skip-verify -format=json > cluster-keys.json"
+                        sh "cat cluster-keys.json && mv cluster-keys.json ${VAULT_SECRET_VAR_NAME}.json"
+                        sh "aws secretsmanager create-secret --name ${VAULT_SECRET_VAR_NAME} || true" // Create an empty secret and ignore if exist
+                        sh "aws secretsmanager put-secret-value --secret-id ${VAULT_SECRET_VAR_NAME} --secret-string file://${VAULT_SECRET_VAR_NAME}.json || true"
+                        //archiveArtifacts artifacts: $VAULT_SECRET_VAR_NAME+".json", fingerprint: true
+                      }
+                    }
+                }
+            }
+        }
+        stage("Vault configure") {
+            when {
+                expression { params.VAULT_CONFIGURE == true }
+            }
+            steps {
+                script {
+                    println "Using AWS Credentials: ${CREDS_ID}"
+                    VAULT_SECRET_VAR_NAME = "vault-${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                    if (params.VAULT_ROOT_TOKEN == "") {
+                        if (params.AWS_SM == true) {
+                            withEnv([
+                              "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                              "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                            ]) {
+                              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                                  VAULT_ROOT_TOKEN = sh(script: "aws secretsmanager get-secret-value --secret-id ${VAULT_SECRET_VAR_NAME} | jq .SecretString | jq -r 'gsub(\"[\\\\n\\\\t]\"; \"\")' | jq -r .root_token", returnStdout: true).trim()
+                              }
+                            }
+                        } else {
+                            VAULT_ROOT_TOKEN = sh(script: "cat terraform/vault/${VAULT_SECRET_VAR_NAME}.json | jq -r .root_token", returnStdout: true).trim()
+                        }
+                    } else {
+                        VAULT_ROOT_TOKEN = params.VAULT_ROOT_TOKEN
+                    }
+                }
+                dir('terraform/vault') {
+                    withEnv([
+                      "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                      "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}"
+                    ]) {
+                      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh "aws eks update-kubeconfig --region ${env.AWS_REGION_EFFECTIVE} --name ${env.EKS_CLUSTER_NAME_EFFECTIVE}"
+                        sh "kubectl -n vault wait --for=condition=Ready pod/vault-0 --timeout=10m"
+                        sh "kubectl cp vault_configure.sh vault/vault-0:/tmp/"
+                        sh "kubectl exec vault-0 -n vault -- sh /tmp/vault_configure.sh ${VAULT_ROOT_TOKEN} ${params.ENVIRONMENT} ${env.AWS_REGION_EFFECTIVE} ${params.VAULT_AWS_IAM_ACCOUNT_ID} ${params.VAULT_AWS_IAM_ROLE_SUFFIX}"
+                      }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        failure {
+            script {
+                if (params.TF_RUN == true) {
+                    sh "cat terraform/vault/${tffile} || true"
+                }
+            }
+        }
+    }
+}

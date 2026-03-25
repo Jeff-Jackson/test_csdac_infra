@@ -1,0 +1,105 @@
+pipeline {
+    agent {
+        dockerfile {
+            filename 'ci/Dockerfile'
+            dir '.'
+            label 'csdac-prod'
+            registryUrl 'https://dockerhub.cisco.com'
+            registryCredentialsId 'cisco-dockerhub-id'
+            args '-u root -it '
+        }
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        ansiColor('xterm')
+    }
+    parameters {
+        string(
+           name: 'AWS_CREDS',
+           defaultValue: "TERRAFORM_CSDAC",
+           description: "AWS credentials ID"
+        )
+        choice(
+           name: 'ACTION',
+           choices:"apply\ndelete",
+           description: "This is the action you have to choose between [apply | delete]."
+        )
+        choice(
+            name: 'CLUSTER',
+            choices: [
+                'csdac-dev-cluster:us-west-1',
+                'csdac-qa-cluster:us-west-1',
+                'csdac-staging-cluster:us-west-1',
+                'csdac-prodeu-cluster:eu-central-1',
+                'csdac-prodapj-cluster:ap-northeast-1',
+                'csdac-prodaus-cluster:ap-southeast-2',
+                'csdac-prodin-cluster:ap-south-1',
+                'csdac-prod-cluster:us-west-1'
+            ],
+            description: 'Choose cluster.'
+        )
+        string(
+           name: 'PREFIX',
+           defaultValue: "",
+           description: "Write a prefix for the namespace. To restrict creation to these namespaces only."
+        )
+        string(
+           name: 'GROUP',
+           defaultValue: "",
+           description: "A group that exists in the aws-auth ConfigMap."
+        )
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    sleep 5
+                }
+            }
+        }
+        stage('Check CREDS'){
+            steps{
+                script {
+                    CREDS_ID = "${params.AWS_CREDS}"
+                    println "Using AWS Credentials: ${CREDS_ID}"
+                }
+            }
+        }
+        stage('AWS CLI Check') {
+            steps {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                                                  credentialsId: CREDS_ID,
+                                                                  usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                                                  passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                    sh 'aws sts get-caller-identity'
+                }
+            }
+        }
+        stage('Apply Restriction for group') {
+            steps {
+                dir('ci/scripts') {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                              credentialsId: CREDS_ID,
+                                              usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                              passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            def cluster = params.CLUSTER.split(':')[0]
+                            def region = params.CLUSTER.split(':')[1]
+                            def action = params.ACTION
+                            def prefix = params.PREFIX
+                            def group = params.GROUP
+
+                            sh "aws eks update-kubeconfig --region ${region} --name ${cluster}"
+                            sh """
+                                chmod +x gatekeeper.sh
+                                ./gatekeeper.sh "${action}" "${prefix}" "${group}"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

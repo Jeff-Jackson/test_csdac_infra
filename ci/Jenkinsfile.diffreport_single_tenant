@@ -1,0 +1,243 @@
+pipeline {
+  agent {
+    dockerfile {
+      filename 'ci/Dockerfile'
+      dir '.'
+      label 'csdac-prod'
+      registryUrl 'https://dockerhub.cisco.com'
+      registryCredentialsId 'cisco-dockerhub-id'
+      args '-u root'
+    }
+  }
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '5'))
+    ansiColor('xterm')
+    // Safety net: don’t let it run forever
+    timeout(time: 3, unit: 'HOURS')
+  }
+
+  parameters {
+    string(name: 'TENANT_NAME', defaultValue: '', description: 'Tenant name, e.g. CDO_cisco-general_motors_security__t5olsk')
+    string(name: 'TARGET_CLUSTER', defaultValue: '', description: 'Optional: run only in this cluster name (speeds up search), e.g. csdac-prod-cluster')
+    string(name: 'TARGET_REGION', defaultValue: '', description: 'Optional: region for TARGET_CLUSTER, e.g. us-west-1')
+  }
+
+  environment {
+    CLUSTERS = 'csdac-prodeu-cluster:eu-central-1,csdac-prodapj-cluster:ap-northeast-1,csdac-prodaus-cluster:ap-southeast-2,csdac-prodin-cluster:ap-south-1,csdac-prod-cluster:us-west-1'
+    AWS_CREDS = 'TERRAFORM_CSDAC_PROD'
+    REPORT_DIR = 'troubleshoot'
+    REPORT_FILE = 'single_diff_report.txt'
+  }
+
+  stages {
+    stage('Init') {
+      steps {
+        script {
+          if (!params.TENANT_NAME?.trim()) {
+            error('TENANT_NAME is required')
+          }
+          echo "TENANT_NAME=${params.TENANT_NAME}"
+          echo "TARGET_CLUSTER=${params.TARGET_CLUSTER}"
+          echo "TARGET_REGION=${params.TARGET_REGION}"
+        }
+      }
+    }
+
+    stage('AWS CLI Check') {
+      steps {
+        script {
+          withCredentials([usernamePassword(credentialsId: env.AWS_CREDS, usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+            def clusterList = env.CLUSTERS.split(',') as List
+            // If user forces single cluster, only check that one
+            if (params.TARGET_CLUSTER?.trim()) {
+              if (!params.TARGET_REGION?.trim()) {
+                error("If TARGET_CLUSTER is set, TARGET_REGION must be set too.")
+              }
+              sh "aws sts get-caller-identity --region ${params.TARGET_REGION}"
+            } else {
+              for (c in clusterList) {
+                def parts = c.split(':')
+                def region = parts[1]
+                sh "aws sts get-caller-identity --region ${region}"
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Run script') {
+      steps {
+        dir(env.REPORT_DIR) {
+          script {
+            sh "rm -f ${env.REPORT_FILE} || true"
+            sh "chmod +x cdcsdac-cli.sh"
+
+            def clusterList = env.CLUSTERS.split(',') as List
+
+            // Build an effective list depending on overrides
+            def effectiveClusters = []
+            if (params.TARGET_CLUSTER?.trim()) {
+              effectiveClusters = ["${params.TARGET_CLUSTER.trim()}:${params.TARGET_REGION.trim()}"]
+            } else {
+              effectiveClusters = clusterList
+            }
+
+            withCredentials([usernamePassword(credentialsId: env.AWS_CREDS, usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+              boolean tenantFound = false
+
+              for (c in effectiveClusters) {
+                def parts = c.split(':')
+                def clusterName = parts[0]
+                def region = parts[1]
+
+                echo "=== Cluster: ${clusterName} (${region}) ==="
+                sh "aws eks update-kubeconfig --region ${region} --name ${clusterName}"
+                sh "kubectl config current-context"
+
+                def tenant = params.TENANT_NAME.trim()
+
+                def ns = ''
+                withEnv(["TENANT_NAME=${tenant}"]) {
+                  ns = sh(
+                    returnStdout: true,
+                    script: '''
+                      set -eu
+
+                      # 1) Prefer label selector (fast path)
+                      ns=$(kubectl get ns -l "muster.cisco.com/x-cdo-tenant-name=${TENANT_NAME}" \
+                        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+                      # 2) Fallback: scan labels+annotations and match by tenant name
+                      if [ -z "$ns" ]; then
+                        ns=$(kubectl get ns -o jsonpath='{range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels.muster\\.cisco\\.com/x-cdo-tenant-name}{"\\t"}{.metadata.annotations.muster\\.cisco\\.com/x-cdo-tenant-name}{"\\n"}{end}' \
+                          | grep -F "${TENANT_NAME}" \
+                          | head -n 1 \
+                          | cut -f1 || true)
+                      fi
+
+                      printf "%s" "$ns"
+                    '''
+                  ).trim()
+                }
+
+                if (!ns) {
+                  echo "Tenant '${tenant}' not found in cluster ${clusterName}. Continuing..."
+                  continue
+                }
+
+                def pod = ''
+                withEnv(["NS=${ns}"]) {
+                  pod = sh(
+                    returnStdout: true,
+                    script: '''
+                      set -eu
+
+                      # List pod names via jsonpath to avoid parsing table output
+                      pod=$(kubectl get pod -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{"\\n"}{end}' 2>/dev/null \
+                        | grep -E '^(fmce|cdofm)' \
+                        | head -n 1 || true)
+
+                      printf "%s" "$pod"
+                    '''
+                  ).trim()
+                }
+
+                if (!pod) {
+                  echo "Tenant '${tenant}' found in namespace ${ns}, but adapter pod not found (fmce|cdofm)."
+                  sh "kubectl get pod -n ${ns} -o wide || true"
+                  sh "echo 'Tenant name: ${tenant}\\nNamespace: ${ns}\\nAdapter pod: absent' >> ${env.REPORT_FILE}"
+                  tenantFound = true
+                  break
+                }
+
+                echo "Tenant '${tenant}' resolved: namespace=${ns}, pod=${pod}"
+                sh "echo 'Diff info from ${clusterName} (${region})' >> ${env.REPORT_FILE}"
+                sh "echo 'Tenant name: ${tenant}' >> ${env.REPORT_FILE}"
+                sh "echo 'Namespace: ${ns}' >> ${env.REPORT_FILE}"
+                sh "echo 'Adapter pod: ${pod}' >> ${env.REPORT_FILE}"
+                sh "./cdcsdac-cli.sh get-diff-all -n ${ns} -p ${pod} >> ${env.REPORT_FILE} 2>&1"
+                sh "echo '\n===================================================\n' >> ${env.REPORT_FILE}"
+
+                tenantFound = true
+                break
+              }
+
+              if (!tenantFound) {
+                // Still produce something for notification
+                sh "echo \"Tenant '${params.TENANT_NAME.trim()}' was not found in scanned clusters.\" >> ${env.REPORT_FILE}"
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Send notification') {
+      steps {
+        dir(env.REPORT_DIR) {
+          script {
+            try {
+              def message = ""
+              def tp_message = ""
+              def file = env.REPORT_FILE
+
+              if (!fileExists(file)) {
+                echo "No report file found, skipping notification."
+                return
+              }
+
+              def fileContent = readFile(file)
+              def sections = fileContent.split(/===================================================/)
+              def notInSyncTenants = []
+
+              sections.each { section ->
+                def syncStatusMatch = (section =~ /Objects are NOT in sync with FMC/)
+                if (syncStatusMatch) {
+                  def tenantNameMatch = (section =~ /Tenant name:\s*(.*)/)
+                  if (tenantNameMatch) {
+                    def tenantNames = tenantNameMatch.collect { it[1].trim() }
+                    def tenantName = tenantNames.last()
+                    notInSyncTenants.add(tenantName)
+                  }
+                }
+              }
+
+              if (notInSyncTenants.isEmpty()) {
+                message += "All tenants are in sync with FMC.\n"
+              } else {
+                tp_message += "<strong>Tenants with objects not in sync: </strong><br>${notInSyncTenants.join(', ')}" +
+                  "  <br><br><strong>Objects re-stream can be executed using the next Jenkins job:</strong><br>" +
+                  "https://engci-private-rtp.cisco.com/jenkins/fp-components/job/CSDAC/job/CSDAC_Restricted/job/Re-stream%20all%20objects%20for%20tenants/ <br>"
+
+                message += "Tenants with objects not in sync: ${notInSyncTenants.join(', ')}\n\n" +
+                  "Objects re-stream can be executed using the next Jenkins job:\n" +
+                  "https://engci-private-rtp.cisco.com/jenkins/fp-components/job/CSDAC/job/CSDAC_Restricted/job/Re-stream%20all%20objects%20for%20tenants/\n"
+
+                withCredentials([string(credentialsId: 'csdac_tp', variable: 'token')])  {
+                  def result = sh(returnStdout: true, script: "python3 create_tp_bug.py ${token} '''${tp_message}''' '''${file}''' ").trim()
+                  message += result
+                }
+              }
+
+              withCredentials([usernamePassword(credentialsId: 'webex_csdac-ops-prod', usernameVariable: 'room_id', passwordVariable: 'bot_token')]) {
+                sh "python3 ./send_report.py ${env.bot_token} ${env.room_id} '''${file}''' '''${message}''' "
+              }
+
+            } catch (err) {
+              echo "${err} Webex notify failed, moving on"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
+    }
+  }
+}

@@ -1,0 +1,1239 @@
+def userId
+def groupId
+
+pipeline {
+  agent { label 'csdac-prod' }
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '5'))
+    timeout(time: 2, unit: 'HOURS')
+    ansiColor('xterm')
+  }
+
+  parameters {
+    choice(
+      name: 'ENVIRONMENT',
+      choices: 'dev\nqa\nci\nstaging\nprod\nprodeu\nprodapj\nprodaus\nprodin\nproduae',
+      description: 'Target environment. Region & AWS credentials are derived automatically.'
+    )
+    string(
+      name: 'AWS_CREDS',
+      defaultValue: "",
+      description: "AWS credentials ID. Leave empty to auto-select based on ENVIRONMENT."
+    )
+    string(
+      name: 'AWS_REGION',
+      defaultValue: "",
+      description: "AWS Region. Leave empty to auto-select based on ENVIRONMENT."
+    )
+    string(
+      name: 'TF_STACK',
+      defaultValue: "eks",
+      description: "Terraspace specific stack to apply"
+    )
+    booleanParam(
+      name: 'TF_PLAN',
+      defaultValue: true,
+      description: 'Run terraform plan before apply/destroy'
+    )
+    choice(
+      name: 'ACTION',
+      choices:"apply\ndestroy",
+      description: "Terraform action, Apply/Destroy"
+    )
+    booleanParam(
+      name: 'TF_INIT_UPGRADE',
+      defaultValue: false,
+      description: 'Run Terraform init with -upgrade for the selected stack(s) before plan/apply'
+    )
+    booleanParam(
+      name: 'PURGE_TS_CACHE',
+      defaultValue: false,
+      description: 'Purge Terraspace/Terraform cache (vendor, .terraspace-cache, .terraform) to avoid stale module/provider issues'
+    )
+    booleanParam(
+      name: 'EKS_SNAPSHOT',
+      defaultValue: false,
+      description: 'Capture read-only EKS/VPC snapshot via AWS CLI into infrastructure/artifacts before plan/apply (recommended for prod)'
+    )
+    booleanParam(
+      name: 'EKS_SMOKE_TESTS',
+      defaultValue: false,
+      description: 'Run basic read-only post-apply EKS smoke checks via AWS CLI and store results in infrastructure/artifacts'
+    )
+    booleanParam(
+      name: 'CA_NTH_CLEANUP',
+      defaultValue: false,
+      description: 'One-time cleanup/reinstall helper for kube-system Helm releases: Cluster Autoscaler (CA) + Node Termination Handler (NTH). Use only when migrating/upgrading modules/state. Avoid enabling on normal runs.'
+    )
+  }
+
+  stages {
+    stage('Get User info') {
+      steps {
+        script {
+          userId = sh(script: "id -u", returnStdout: true).trim()
+          groupId = sh(script: "id -g", returnStdout: true).trim()
+
+          echo "USER ${userId}:${groupId}"
+        }
+      }
+    }
+
+    stage('Resolve AWS context') {
+      steps {
+        script {
+          // Normalize env name once
+          def envName = (params.ENVIRONMENT ?: '').trim().toLowerCase()
+
+          // Map ENVIRONMENT -> default region
+          def envToRegion = [
+            // Dev account (default)
+            'dev'     : 'us-west-1',
+            'qa'      : 'us-west-1',
+            'ci'      : 'us-west-1',
+            'staging' : 'us-west-1',
+
+            // Prod regions
+            'prod'    : 'us-west-1',
+            'prodeu'  : 'eu-central-1',
+            'prodapj' : 'ap-northeast-1',
+            'prodaus' : 'ap-southeast-2',
+            'prodin'  : 'ap-south-1',
+            'produae' : 'me-central-1',
+          ]
+
+          // Account boundary detection
+          def isFed  = envName.contains('fed') // future-proof
+          def isProd = ['prod','prodeu','prodapj','prodaus','prodin','produae'].contains(envName)
+
+          // Default creds per account boundary
+          // - Dev/QA/CI/Staging -> TERRAFORM_CSDAC
+          // - Prod*            -> TERRAFORM_CSDAC_PROD
+          // - *fed*            -> AWS_GOV_CLOUD_CSDAC
+          def defaultCreds = isFed ? 'AWS_GOV_CLOUD_CSDAC'
+                                   : (isProd ? 'TERRAFORM_CSDAC_PROD' : 'TERRAFORM_CSDAC')
+
+          // Allow manual override via parameters
+          env.AWS_REGION_EFFECTIVE = (params.AWS_REGION?.trim())
+            ? params.AWS_REGION.trim()
+            : (envToRegion[envName] ?: 'us-west-1')
+
+          env.CREDS_ID_EFFECTIVE = (params.AWS_CREDS?.trim())
+            ? params.AWS_CREDS.trim()
+            : defaultCreds
+
+          // Keep backward compatible variable name used later in the pipeline
+          CREDS_ID = env.CREDS_ID_EFFECTIVE
+
+          echo "Resolved AWS context: ENV=${params.ENVIRONMENT} REGION=${env.AWS_REGION_EFFECTIVE} CREDS=${env.CREDS_ID_EFFECTIVE}"
+        }
+      }
+    }
+
+    stage('Build inside Docker') {
+      agent {
+        dockerfile {
+          filename 'ci/Dockerfile'
+          dir '.'
+          label 'csdac-prod'
+          args "-u root"
+        }
+      }
+
+      stages {
+        stage('Purge cache') {
+          when {
+            expression { params.PURGE_TS_CACHE == true }
+          }
+          steps {
+            dir('infrastructure') {
+              sh '''#!/bin/bash
+                set -euo pipefail
+                echo "[purge] Removing Terraspace/Terraform caches in $(pwd)"
+                rm -rf .terraspace-cache || true
+                rm -rf vendor || true
+                rm -rf .terraform || true
+                rm -f  .terraform.lock.hcl || true
+                rm -rf log/plan log/up || true
+                echo "[purge] Done"
+              '''
+            }
+          }
+        }
+
+        stage('Terraspace bundle') {
+          steps {
+            script {
+              println "Using AWS context:"
+              println "CREDS_ID_EFFECTIVE=${env.CREDS_ID_EFFECTIVE}"
+              println "AWS_REGION_EFFECTIVE=${env.AWS_REGION_EFFECTIVE}"
+
+              withCredentials([string(credentialsId: 'fedramp_staging_ansible_user_key', variable: 'PUBLIC_KEY')]) {
+                env.ANSIBLE_PUBLIC_KEY = PUBLIC_KEY
+              }
+            }
+            dir('infrastructure') {
+              sh "bundle install"
+              sh "terraspace bundle"
+            }
+          }
+        }
+
+        stage('Preflight: OCI registry (public.ecr.aws)') {
+          when {
+            expression { params.TF_STACK == '' || params.TF_STACK == 'eks' }
+          }
+          steps {
+            dir('infrastructure') {
+              sh '''#!/bin/bash -l
+                set -euo pipefail
+
+                echo "[preflight] DNS lookup public.ecr.aws"
+                (getent hosts public.ecr.aws || nslookup public.ecr.aws || dig +short public.ecr.aws) || true
+
+                echo "[preflight] HTTPS reachability (expect 200/3xx or at least TLS handshake)"
+                curl -sS -I --connect-timeout 5 --max-time 10 https://public.ecr.aws/ | head -n 5 || true
+
+                echo "[preflight] OCI registry endpoint ping (Docker v2 compatible)"
+                # Some environments block this; even a 401 is OK (means reachable)
+                curl -sS -I --connect-timeout 5 --max-time 10 https://public.ecr.aws/v2/ | head -n 20 || true
+
+                echo "[preflight] helm binary presence"
+                if command -v helm >/dev/null 2>&1; then
+                  echo "[preflight] helm version"
+                  helm version || true
+
+                  echo "[preflight] try helm pull from OCI (NTH chart)"
+                  helm registry login public.ecr.aws >/dev/null 2>&1 || true
+                  helm pull oci://public.ecr.aws/aws-ec2/helm/aws-node-termination-handler --version 0.27.3 --destination /tmp || true
+                  ls -la /tmp/aws-node-termination-handler-0.27.3.tgz 2>/dev/null || true
+                else
+                  echo "[preflight] helm not found in this Docker image; skipping helm pull test"
+                fi
+              '''
+            }
+          }
+        }
+
+        stage('Prepare dependency backends (extra + vpc)') {
+          steps {
+            dir('infrastructure') {
+              withCredentials([[
+                $class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+              ]]) {
+                script {
+                  def region = env.AWS_REGION_EFFECTIVE
+                  def tenv   = params.ENVIRONMENT
+
+                  withEnv([
+                    "TS_ENV=${tenv}",
+                    "TS_VAR_region=${region}",
+                    "AWS_REGION=${region}"
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      # Terraspace may attempt `terraform state pull` for dependency stacks (extra/vpc)
+                      # while building another stack (eks). On a cold cache, those dependency stack
+                      # cache dirs exist but have not run `terraform init` yet, which triggers:
+                      #   "Backend initialization required"
+                      #
+                      # Fix strategy (reliable in CI):
+                      #  1) Ensure cache dirs exist (build is allowed to fail on first pass)
+                      #  2) Run `terraform init -reconfigure` inside each dependency cache dir
+                      #  3) Validate backend readiness with `terraform state pull`
+
+                      prep_stack () {
+                        local stack="$1"
+                        local dir=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/${stack}"
+
+                        echo "[prep-deps] Ensure cache dir exists for stack=${stack}"
+                        # Create/render cache. Allow failure because Terraspace can try to pull remote state
+                        # before backend is initialized in this cache dir.
+                        terraspace init "${stack}" || true
+
+                        if [ ! -d "${dir}" ]; then
+                          echo "ERROR: expected cache dir not found: ${dir}"
+                          echo "DEBUG: listing .terraspace-cache"; ls -la .terraspace-cache || true
+                          exit 1
+                        fi
+
+                        echo "[prep-deps] terraform init -reconfigure in ${dir}"
+                        (cd "${dir}" && terraform init -reconfigure -input=false)
+
+                        echo "[prep-deps] validate backend with terraform state pull in ${dir}"
+                        (cd "${dir}" && terraform state pull >/dev/null)
+                      }
+
+                      prep_stack extra
+                      prep_stack vpc
+
+                      echo "[prep-deps] OK: dependency backends are initialized (extra + vpc)"
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('Terraform Init (upgrade)') {
+          when {
+            expression { params.TF_INIT_UPGRADE == true }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[
+                $class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+              ]]) {
+                script {
+                  def stackDir = ".terraspace-cache/${env.AWS_REGION_EFFECTIVE}/${params.ENVIRONMENT}/stacks/${params.TF_STACK}"
+
+                  withEnv([
+                    "TS_ENV=${params.ENVIRONMENT}",
+                    "TS_VAR_region=${env.AWS_REGION_EFFECTIVE}",
+                    "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "TF_STACK=${params.TF_STACK}",
+                    "STACK_DIR=${stackDir}",
+                  ]) {
+                    if (params.TF_STACK == "") {
+                      sh '''#!/bin/bash -l
+                        set -euo pipefail
+                        echo "[init] TS_ENV=${TS_ENV} AWS_REGION=${AWS_REGION} TS_VAR_region=${TS_VAR_region}"
+                        terraspace all init
+                      '''
+
+                      sh '''#!/bin/bash -l
+                        set -euo pipefail
+                        # Clean stale lock files across cache to avoid version pin drift
+                        find .terraspace-cache -type f -name ".terraform.lock.hcl" -delete || true
+
+                        # Upgrade providers in each cached stack (best-effort)
+                        find .terraspace-cache -type d -name ".terraform" -print0 | while IFS= read -r -d '' d; do
+                          (cd "$(dirname "$d")" && terraform init -upgrade -input=false) || true
+                        done
+                      '''
+                    } else {
+                      sh '''#!/bin/bash -l
+                        set -euo pipefail
+                        echo "[init] TS_ENV=${TS_ENV} AWS_REGION=${AWS_REGION} TS_VAR_region=${TS_VAR_region} TF_STACK=${TF_STACK}"
+                        terraspace init "${TF_STACK}"
+                      '''
+
+                      sh '''#!/bin/bash -l
+                        set -euo pipefail
+
+                        # Clean stale lock files (best-effort)
+                        find .terraspace-cache -type f -name ".terraform.lock.hcl" -delete || true
+
+                        if [ -d "${STACK_DIR}" ]; then
+                          echo "[init-upgrade] terraform init -upgrade in ${STACK_DIR}"
+                          (cd "${STACK_DIR}" && terraform init -upgrade -input=false)
+
+                          echo "--- Providers in ${STACK_DIR} ---"
+                          (cd "${STACK_DIR}" && terraform providers) || true
+                        else
+                          echo "WARN: Cache dir ${STACK_DIR} not found; skipping terraform init -upgrade"
+                          echo "      Expected after terraspace init ${TF_STACK}"
+                          ls -la .terraspace-cache || true
+                        fi
+                      '''
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('EKS Snapshot') {
+          when {
+            expression {
+              return (params.EKS_SNAPSHOT == true) && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                script {
+                  // Best-effort cluster name derivation for your naming convention
+                  def clusterName = "csdac-${params.ENVIRONMENT}-cluster"
+
+                  withEnv([
+                    "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "TS_ENV=${params.ENVIRONMENT}",
+                    "CLUSTER_NAME=${clusterName}"
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || /bin/date -u +%Y%m%dT%H%M%SZ)"
+                      OUT_DIR="artifacts/eks-snapshot/${TS_ENV}/${AWS_REGION}/${CLUSTER_NAME}/${TS}"
+                      mkdir -p "${OUT_DIR}"
+
+                      echo "[snapshot] → ${OUT_DIR}"
+                      aws sts get-caller-identity --output json > "${OUT_DIR}/sts_get_caller_identity.json" || true
+
+                      aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_describe_cluster.json" || true
+
+                      aws eks list-addons --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_addons.json" || true
+
+                      aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_nodegroups.json" || true
+
+                      aws eks list-access-entries --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_access_entries.json" || true
+
+                      if command -v jq >/dev/null 2>&1 && [ -s "${OUT_DIR}/eks_describe_cluster.json" ]; then
+                        VPC_ID="$(jq -r '.cluster.resourcesVpcConfig.vpcId // empty' "${OUT_DIR}/eks_describe_cluster.json")"
+                        if [ -n "${VPC_ID}" ]; then
+                          aws ec2 describe-vpcs --vpc-ids "${VPC_ID}" --region "${AWS_REGION}" --output json \
+                            > "${OUT_DIR}/ec2_describe_vpc_${VPC_ID}.json" || true
+                        fi
+
+                        jq -r '.cluster.resourcesVpcConfig.securityGroupIds[]?' "${OUT_DIR}/eks_describe_cluster.json" | while read -r sg; do
+                          aws ec2 describe-security-groups --group-ids "$sg" --region "${AWS_REGION}" --output json \
+                            > "${OUT_DIR}/ec2_describe_sg_${sg}.json" || true
+                        done
+
+                        jq -r '.cluster.resourcesVpcConfig.subnetIds[]?' "${OUT_DIR}/eks_describe_cluster.json" | while read -r sn; do
+                          aws ec2 describe-subnets --subnet-ids "$sn" --region "${AWS_REGION}" --output json \
+                            > "${OUT_DIR}/ec2_describe_subnet_${sn}.json" || true
+                        done
+                      fi
+
+                      echo "[snapshot] files:"; ls -la "${OUT_DIR}" || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('State cleanup (helm CA + NTH)') {
+          when {
+            expression {
+              // Run only when explicitly requested. Keeps normal runs idempotent and avoids re-install churn.
+              return (params.CA_NTH_CLEANUP == true) && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                script {
+                  def region = env.AWS_REGION_EFFECTIVE
+                  def tenv   = params.ENVIRONMENT
+                  def eksDir = ".terraspace-cache/${region}/${tenv}/stacks/eks"
+
+                  withEnv([
+                    "TS_ENV=${tenv}",
+                    "TS_VAR_region=${region}",
+                    "AWS_REGION=${region}",
+                    "AWS_DEFAULT_REGION=${region}",
+                    "EKS_DIR=${eksDir}",
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      echo "[state-rm] Preparing Terraspace cache for eks"
+                      terraspace init eks || true
+
+                      if [ ! -d "${EKS_DIR}" ]; then
+                        echo "ERROR: expected eks cache dir not found: ${EKS_DIR}"
+                        echo "DEBUG: listing .terraspace-cache"; ls -la .terraspace-cache || true
+                        exit 1
+                      fi
+
+                      echo "[state-rm] Current state entries (filtered):"
+                      (cd "${EKS_DIR}" && terraform state list | grep -F 'helm_release.' | grep -E '(cluster_autoscaler|aws_node_termination_handler)$') || true
+
+                      echo "[state-rm] Full matching list:"
+                      (cd "${EKS_DIR}" && terraform state list | grep -F 'helm_release.' | grep -E '(cluster_autoscaler|aws_node_termination_handler)$') || true
+
+                      echo "[state-rm] Removing from state (best-effort):"
+                      addrs=$(cd "${EKS_DIR}" && terraform state list | grep -F 'helm_release.' | grep -E '(cluster_autoscaler|aws_node_termination_handler)$' || true)
+
+                      if [ -z "${addrs}" ]; then
+                        echo "[state-rm] WARN: No matching helm_release addresses found in state."
+                      else
+                        echo "[state-rm] Will remove these addresses:"
+                        echo "${addrs}"
+                        while IFS= read -r addr; do
+                          [ -n "${addr}" ] || continue
+                          (cd "${EKS_DIR}" && terraform state rm "${addr}") || true
+                        done <<< "${addrs}"
+                      fi
+
+                      echo "[state-rm] After removal (filtered):"
+                      (cd "${EKS_DIR}" && terraform state list | grep -F 'helm_release.' | grep -E '(cluster_autoscaler|aws_node_termination_handler)$') || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('State cleanup (EKS KMS key: detach from state)') {
+          when {
+            expression {
+              // Run only when explicitly requested. Detaches legacy, root-level KMS resources from state during upgrades.
+              return (params.TF_INIT_UPGRADE == true) && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+              ]]) {
+                script {
+                  def region = env.AWS_REGION_EFFECTIVE
+                  def tenv   = params.ENVIRONMENT
+                  def eksDir = ".terraspace-cache/${region}/${tenv}/stacks/eks"
+
+                  withEnv([
+                    "TS_ENV=${tenv}",
+                    "TS_VAR_region=${region}",
+                    "AWS_REGION=${region}",
+                    "AWS_DEFAULT_REGION=${region}",
+                    "EKS_DIR=${eksDir}",
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      echo "[kms-state-rm] Preparing Terraspace cache for eks"
+                      terraspace init eks || true
+
+                      if [ ! -d "${EKS_DIR}" ]; then
+                        echo "ERROR: expected eks cache dir not found: ${EKS_DIR}"
+                        echo "DEBUG: listing .terraspace-cache"; ls -la .terraspace-cache || true
+                        exit 1
+                      fi
+
+                      echo "[kms-state-rm] Detect KMS resources in state (aws_kms_key.eks / aws_kms_alias.eks)"
+                      (cd "${EKS_DIR}" && terraform state list | grep -E '^aws_kms_(key|alias)\\.eks(\\[0\\])?$') || true
+
+                      rm_addrs=$(cd "${EKS_DIR}" && terraform state list | grep -E '^aws_kms_(key|alias)\\.eks(\\[0\\])?$' || true)
+
+                      if [ -z "${rm_addrs}" ]; then
+                        echo "[kms-state-rm] INFO: No matching aws_kms_key/alias resources found in state. Nothing to detach."
+                      else
+                        echo "[kms-state-rm] Will detach these addresses from state (NO AWS deletion):"
+                        echo "${rm_addrs}"
+                        while IFS= read -r addr; do
+                          [ -n "${addr}" ] || continue
+                          (cd "${EKS_DIR}" && terraform state rm "${addr}")
+                        done <<< "${rm_addrs}"
+                      fi
+
+                      echo "[kms-state-rm] After detach (should be empty):"
+                      (cd "${EKS_DIR}" && terraform state list | grep -E '^aws_kms_(key|alias)\\.eks(\\[0\\])?$') || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('Helm cleanup existing releases (CA + NTH)') {
+          when {
+            expression {
+              // Run only when explicitly requested. Keeps normal runs idempotent and avoids re-install churn.
+              return (params.CA_NTH_CLEANUP == true) && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                credentialsId: CREDS_ID,
+                                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                script {
+                  def region = env.AWS_REGION_EFFECTIVE
+                  def tenv   = params.ENVIRONMENT
+                  def clusterName = "csdac-${params.ENVIRONMENT}-cluster"
+
+                  withEnv([
+                    "AWS_REGION=${region}",
+                    "AWS_DEFAULT_REGION=${region}",
+                    "TS_ENV=${tenv}",
+                    "CLUSTER_NAME=${clusterName}",
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      echo "[helm-cleanup] Using cluster ${CLUSTER_NAME} in ${AWS_REGION}"
+                      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null
+
+                      echo "[helm-cleanup] Existing releases (kube-system, filtered):"
+                      helm -n kube-system list 2>/dev/null | egrep '(cluster-autoscaler|aws-node-termination-handler)' || true
+
+                      echo "[helm-cleanup] RBAC sanity (delete in kube-system?):"
+                      kubectl auth can-i delete secrets -n kube-system || true
+                      kubectl auth can-i delete deployments -n kube-system || true
+
+                      for rel in cluster-autoscaler aws-node-termination-handler; do
+                        echo "[helm-cleanup] --- release=${rel} ---"
+                        helm -n kube-system status "${rel}" || true
+
+                        if helm -n kube-system status "${rel}" >/dev/null 2>&1; then
+                          echo "[helm-cleanup] Uninstalling ${rel} (wait up to 10m)"
+                          if ! helm -n kube-system uninstall "${rel}" --wait --timeout 10m; then
+                            echo "[helm-cleanup] WARN: uninstall failed for ${rel}. Dumping diagnostics..."
+                            kubectl -n kube-system get events --sort-by=.lastTimestamp | tail -n 50 || true
+
+                            echo "[helm-cleanup] Helm secrets for ${rel}:"
+                            kubectl -n kube-system get secret -l "owner=helm,name=${rel}" || true
+
+                            echo "[helm-cleanup] Fallback: deleting Helm release secrets for ${rel} (best-effort)"
+                            kubectl -n kube-system delete secret -l "owner=helm,name=${rel}" --ignore-not-found=true || true
+                          fi
+                        else
+                          echo "[helm-cleanup] Release not found: ${rel}"
+                        fi
+
+                        echo "[helm-cleanup] Verify presence after uninstall attempt: ${rel}"
+                        helm -n kube-system list --filter "^${rel}$" || true
+                      done
+
+                      echo "[helm-cleanup] Remaining releases (kube-system, filtered):"
+                      helm -n kube-system list 2>/dev/null | egrep '(cluster-autoscaler|aws-node-termination-handler)' || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('Helm sanity: unlock Velero (vmware-tanzu)') {
+          when {
+            expression {
+              // Only relevant during upgrade flows.
+              return (params.TF_INIT_UPGRADE == true) && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                credentialsId: CREDS_ID,
+                                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                script {
+                  def region = env.AWS_REGION_EFFECTIVE
+                  def tenv   = params.ENVIRONMENT
+                  def clusterName = "csdac-${params.ENVIRONMENT}-cluster"
+
+                  withEnv([
+                    "AWS_REGION=${region}",
+                    "AWS_DEFAULT_REGION=${region}",
+                    "TS_ENV=${tenv}",
+                    "CLUSTER_NAME=${clusterName}",
+                    "VELERO_RELEASE=vmware-tanzu",
+                    "VELERO_NS=velero",
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      echo "[velero-unlock] Using cluster ${CLUSTER_NAME} in ${AWS_REGION}"
+                      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null
+
+                      # If Velero is not installed in this cluster/region, skip this stage gracefully.
+                      if ! kubectl get ns "${VELERO_NS}" >/dev/null 2>&1; then
+                        echo "[velero-unlock] INFO: namespace ${VELERO_NS} not found; Velero likely not installed. Skipping."
+                        exit 0
+                      fi
+
+                      if ! helm -n "${VELERO_NS}" status "${VELERO_RELEASE}" >/dev/null 2>&1; then
+                        echo "[velero-unlock] INFO: Helm release ${VELERO_RELEASE} not found in ns=${VELERO_NS}; Velero likely not installed. Skipping."
+                        helm -n "${VELERO_NS}" list || true
+                        exit 0
+                      fi
+
+                      echo "[velero-unlock] Jobs/pods (velero):"
+                      kubectl -n "${VELERO_NS}" get jobs || true
+                      kubectl -n "${VELERO_NS}" get pods || true
+
+                      # Kill stuck upgrade-crds job if present (it blocks Helm operations)
+                      if kubectl -n "${VELERO_NS}" get job | grep -q "${VELERO_RELEASE}-velero-upgrade-crds"; then
+                        echo "[velero-unlock] Found upgrade-crds job; dumping quick diagnostics"
+                        kubectl -n "${VELERO_NS}" get pods | grep "${VELERO_RELEASE}-velero-upgrade-crds" || true
+                        kubectl -n "${VELERO_NS}" get events --sort-by=.lastTimestamp | tail -n 30 || true
+
+                        echo "[velero-unlock] Deleting stuck upgrade-crds job/pods"
+                        kubectl -n "${VELERO_NS}" delete job "${VELERO_RELEASE}-velero-upgrade-crds" --ignore-not-found=true || true
+                        kubectl -n "${VELERO_NS}" delete pod -l "job-name=${VELERO_RELEASE}-velero-upgrade-crds" --ignore-not-found=true || true
+                      fi
+
+                      echo "[velero-unlock] Helm history:"
+                      # Release existence already validated above
+                      helm -n "${VELERO_NS}" history "${VELERO_RELEASE}" || true
+
+                      echo "[velero-unlock] check kubectl image:"
+                      # Helm manifest is always available if release exists; keep as best-effort
+                      helm -n "${VELERO_NS}" get manifest "${VELERO_RELEASE}" | sed -n '/upgrade-crds/,$p' | head -n 200 || true
+
+                      # The hook job may already be deleted (hook-delete-policy). Do not fail the stage if it's gone.
+                      if kubectl -n "${VELERO_NS}" get job "${VELERO_RELEASE}-velero-upgrade-crds" >/dev/null 2>&1; then
+                        kubectl -n "${VELERO_NS}" get job "${VELERO_RELEASE}-velero-upgrade-crds" -o yaml | egrep -n 'image:|name:|command:|args:' || true
+                      else
+                        echo "[velero-unlock] INFO: job ${VELERO_RELEASE}-velero-upgrade-crds not found (likely completed and deleted by hook policy)"
+                      fi
+
+                      pending=$(helm -n "${VELERO_NS}" history "${VELERO_RELEASE}" 2>/dev/null | egrep -i 'pending-(install|upgrade|rollback)' || true)
+                      if [ -n "${pending}" ]; then
+                        echo "[velero-unlock] WARN: pending operation detected:"
+                        echo "${pending}"
+
+                        echo "[velero-unlock] Deleting the newest Helm release secrets (best-effort) to remove lock"
+                        # Delete newest secrets first (vN ...), keep old deployed revision
+                        kubectl -n "${VELERO_NS}" get secret -o name | grep -F "secret/sh.helm.release.v1.${VELERO_RELEASE}.v" | \\
+                          sed 's/.*\\.v//' | sort -n | tail -n 3 | while read -r n; do
+                            [ -n "$n" ] || continue
+                            echo "[velero-unlock] delete secret v${n}"
+                            kubectl -n "${VELERO_NS}" delete secret "sh.helm.release.v1.${VELERO_RELEASE}.v${n}" --ignore-not-found=true || true
+                          done
+                      else
+                        echo "[velero-unlock] OK: no pending detected"
+                      fi
+
+                      echo "[velero-unlock] Status/revision before deciding rollback:"
+                      current_status=$(helm -n "${VELERO_NS}" status "${VELERO_RELEASE}" 2>/dev/null | awk -F': ' '/^STATUS:/{print $2}' | tr -d '\r' || true)
+                      current_rev=$(helm -n "${VELERO_NS}" status "${VELERO_RELEASE}" 2>/dev/null | awk -F': ' '/^REVISION:/{print $2}' | tr -d '\r' || true)
+                      echo "[velero-unlock] current_status=${current_status:-unknown} current_rev=${current_rev:-unknown}"
+
+                      echo "[velero-unlock] Find last deployed revision:"
+                      last_deployed=$(helm -n "${VELERO_NS}" history "${VELERO_RELEASE}" 2>/dev/null | awk 'NR>1 && tolower($0) ~ /deployed/ {rev=$1} END{print rev}')
+
+                      # Only rollback if we detected a pending operation or the release is not deployed.
+                      # Also avoid a no-op rollback to the same revision, because Helm will still create a new revision.
+                      if [ -n "${pending}" ] || [ "${current_status}" != "deployed" ]; then
+                        if [ -n "${last_deployed}" ] && [ "${current_rev}" != "${last_deployed}" ]; then
+                          echo "[velero-unlock] Rollback to last deployed revision=${last_deployed} (no hooks)"
+                          helm -n "${VELERO_NS}" rollback "${VELERO_RELEASE}" "${last_deployed}" --no-hooks --wait --timeout 10m || true
+                        else
+                          echo "[velero-unlock] INFO: rollback not needed (last_deployed=${last_deployed:-empty}, current_rev=${current_rev:-empty})"
+                        fi
+                      else
+                        echo "[velero-unlock] OK: release is deployed and no pending detected; skipping rollback"
+                      fi
+
+                      echo "[velero-unlock] Final status/history:"
+                      helm -n "${VELERO_NS}" status "${VELERO_RELEASE}" || true
+                      helm -n "${VELERO_NS}" history "${VELERO_RELEASE}" || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('Terraform Plan') {
+          when {
+            expression { params.TF_PLAN == true }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+
+                withEnv([
+                  "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                  "AWS_REGION_EFFECTIVE=${env.AWS_REGION_EFFECTIVE}",
+                  "ENVIRONMENT=${params.ENVIRONMENT}"
+                ]) {
+
+                  // Fail fast: backend readiness for dependency stacks (extra/vpc)
+                  sh '''#!/bin/bash -l
+                    set -euo pipefail
+                    for s in extra vpc; do
+                      d=".terraspace-cache/${AWS_REGION_EFFECTIVE}/${ENVIRONMENT}/stacks/${s}"
+                      if [ -d "$d" ]; then
+                        echo "[pre-plan] backend check: $s"
+                        (cd "$d" && terraform state pull >/dev/null)
+                      else
+                        echo "[pre-plan] WARN: missing cache dir: $d (will rely on Terraspace)"
+                      fi
+                    done
+                  '''
+
+                  script {
+                    if (params.TF_STACK == "") {
+                      sh "TF_VAR_ansible_public_key='${env.ANSIBLE_PUBLIC_KEY}' TS_ENV=${params.ENVIRONMENT} TS_VAR_region=${env.AWS_REGION_EFFECTIVE} AWS_REGION=${env.AWS_REGION_EFFECTIVE} terraspace all plan"
+                    } else {
+                      sh "TF_VAR_ansible_public_key='${env.ANSIBLE_PUBLIC_KEY}' TS_ENV=${params.ENVIRONMENT} TS_VAR_region=${env.AWS_REGION_EFFECTIVE} AWS_REGION=${env.AWS_REGION_EFFECTIVE} terraspace plan ${params.TF_STACK}"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage("Terraform Action") {
+          steps {
+            script {
+              timeout(time: 10, unit: "MINUTES") {
+                input message: "Approve ${params.ACTION} for ${params.ENVIRONMENT}?", ok: "Yes"
+              }
+
+              dir('infrastructure') {
+                withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                  credentialsId: CREDS_ID,
+                  usernameVariable: 'AWS_ACCESS_KEY_ID',
+                  passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+
+                  // Ensure AWS region is always set for AWS CLI + Terraform backend/S3 calls.
+                  // Without this, AWS CLI may build an invalid STS endpoint like: https://sts..amazonaws.com
+                  withEnv([
+                    "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "AWS_STS_REGIONAL_ENDPOINTS=regional"
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+                      aws --version
+                      echo "[aws] AWS_REGION=${AWS_REGION} AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
+                      aws sts get-caller-identity
+                    '''
+
+                    if (params.TF_STACK == "") {
+                      sh "TF_VAR_ansible_public_key='${env.ANSIBLE_PUBLIC_KEY}' TS_ENV=${params.ENVIRONMENT} TS_VAR_region=${env.AWS_REGION_EFFECTIVE} AWS_REGION=${env.AWS_REGION_EFFECTIVE} terraspace all up --yes"
+                    } else {
+                      sh "TF_VAR_ansible_public_key='${env.ANSIBLE_PUBLIC_KEY}' TS_ENV=${params.ENVIRONMENT} TS_VAR_region=${env.AWS_REGION_EFFECTIVE} AWS_REGION=${env.AWS_REGION_EFFECTIVE} terraspace up ${params.TF_STACK} --yes"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('EKS Smoke tests') {
+          when {
+            expression {
+              return (params.EKS_SMOKE_TESTS == true) && (params.ACTION == 'apply') && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                script {
+                  def clusterName = "csdac-${params.ENVIRONMENT}-cluster"
+                  withEnv([
+                    "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "TS_ENV=${params.ENVIRONMENT}",
+                    "CLUSTER_NAME=${clusterName}"
+                  ]) {
+                    sh '''#!/bin/bash -l
+                      set -euo pipefail
+
+                      TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || /bin/date -u +%Y%m%dT%H%M%SZ)"
+                      OUT_DIR="artifacts/eks-smoke/${TS_ENV}/${AWS_REGION}/${CLUSTER_NAME}/${TS}"
+                      mkdir -p "${OUT_DIR}"
+
+                      echo "[smoke] → ${OUT_DIR}"
+                      aws sts get-caller-identity --output json > "${OUT_DIR}/sts_get_caller_identity.json" || true
+
+                      aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_describe_cluster.json" || true
+
+                      aws eks list-addons --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_addons.json" || true
+
+                      aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_nodegroups.json" || true
+
+                      aws eks list-access-entries --cluster-name "${CLUSTER_NAME}" --region "${AWS_REGION}" --output json \
+                        > "${OUT_DIR}/eks_list_access_entries.json" || true
+
+                      echo "[smoke] files:"; ls -la "${OUT_DIR}" || true
+                    '''
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        stage('EKS Smoke Test (Networking)') {
+          when {
+            expression {
+              return (params.EKS_SMOKE_TESTS == true) && (params.ACTION == 'apply') && (params.TF_STACK == '' || params.TF_STACK == 'eks')
+            }
+          }
+          steps {
+            dir('infrastructure') {
+              withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                credentialsId: CREDS_ID,
+                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+
+                script {
+                  def clusterName = "csdac-${params.ENVIRONMENT}-cluster"
+                  withEnv([
+                    "AWS_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "AWS_DEFAULT_REGION=${env.AWS_REGION_EFFECTIVE}",
+                    "AWS_STS_REGIONAL_ENDPOINTS=regional",
+                    "TS_ENV=${params.ENVIRONMENT}",
+                    "CLUSTER_NAME=${clusterName}",
+                    // Keep kubeconfig local to the workspace to avoid cross-build contamination
+                    "KUBECONFIG=${pwd()}/artifacts/kubeconfig-${params.ENVIRONMENT}-${env.AWS_REGION_EFFECTIVE}"
+                  ]) {
+                    sh(label: 'Smoke test: pod-to-pod + pod-to-node', script: '''
+                      #!/bin/sh
+                      set -eu
+
+                      echo "[smoke] Using cluster ${CLUSTER_NAME} in ${AWS_REGION}"
+                      mkdir -p artifacts
+
+                      # EKS auth uses exec plugin that calls AWS CLI (aws eks get-token).
+                      # We must have AWS_* credentials in env for kubectl to authenticate.
+                      aws --version
+                      aws sts get-caller-identity
+                      aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" >/dev/null
+
+                      NS="smoke-net-${BUILD_NUMBER:-manual}"
+                      IMG="nicolaka/netshoot:latest"
+                      P1="netshoot-a"
+                      P2="netshoot-b"
+
+                      SVC_NAME="smoke-echo"
+                      SVC_PORT="80"
+                      ECHO_IMAGE="registry.k8s.io/e2e-test-images/agnhost:2.45"
+                      SUMMARY_FILE="artifacts/smoke-net-summary-${NS}.txt"
+
+                      echo "[smoke] Creating namespace: ${NS}"
+                      kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+
+                      cleanup() {
+                        echo "[smoke] Cleanup namespace: ${NS}"
+
+                        # Always capture diagnostics before deleting the namespace (best-effort)
+                        kubectl -n "${NS}" get pods -o wide >"artifacts/smoke-${NS}-pods.txt" 2>&1 || true
+                        kubectl -n "${NS}" get events --sort-by=.lastTimestamp >"artifacts/smoke-${NS}-events.txt" 2>&1 || true
+
+                        # Describe pods if they exist
+                        kubectl -n "${NS}" describe pod "${P1}" >"artifacts/smoke-${NS}-describe-${P1}.txt" 2>&1 || true
+                        kubectl -n "${NS}" describe pod "${P2}" >"artifacts/smoke-${NS}-describe-${P2}.txt" 2>&1 || true
+
+                        # Scheduler-related info
+                        kubectl -n "${NS}" get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.reason}{"\t"}{.status.message}{"\n"}{end}' \
+                          >"artifacts/smoke-${NS}-pod-phases.txt" 2>&1 || true
+
+                        # kube-system diagnostics that commonly explain why pods don't become Ready
+                        kubectl -n kube-system get pods -o wide | egrep 'aws-node|coredns|kube-proxy' >"artifacts/smoke-${NS}-kube-system-pods.txt" 2>&1 || true
+                        kubectl -n kube-system describe ds aws-node >"artifacts/smoke-${NS}-describe-aws-node-ds.txt" 2>&1 || true
+                        kubectl -n kube-system describe ds kube-proxy >"artifacts/smoke-${NS}-describe-kube-proxy-ds.txt" 2>&1 || true
+                        kubectl -n kube-system describe deploy coredns >"artifacts/smoke-${NS}-describe-coredns-deploy.txt" 2>&1 || true
+
+                        # Nodes snapshot + short describe for the chosen nodes
+                        kubectl get nodes -o wide >"artifacts/smoke-${NS}-nodes.txt" 2>&1 || true
+                        kubectl describe node "${NODE_A}" >"artifacts/smoke-${NS}-describe-nodeA.txt" 2>&1 || true
+                        kubectl describe node "${NODE_B}" >"artifacts/smoke-${NS}-describe-nodeB.txt" 2>&1 || true
+
+                        # If pods were scheduled, capture their previous logs (best-effort)
+                        kubectl -n "${NS}" logs "${P1}" --all-containers=true --tail=200 >"artifacts/smoke-${NS}-logs-${P1}.txt" 2>&1 || true
+                        kubectl -n "${NS}" logs "${P2}" --all-containers=true --tail=200 >"artifacts/smoke-${NS}-logs-${P2}.txt" 2>&1 || true
+
+                        kubectl delete ns "${NS}" --ignore-not-found=true >/dev/null 2>&1 || true
+                      }
+                      trap cleanup EXIT
+
+                      dump_on_failure() {
+                        local what="$1"
+                        echo "[smoke] ERROR: ${what}"
+
+                        echo "[smoke] --- quick namespace snapshot (${NS}) ---"
+                        kubectl -n "${NS}" get pods -o wide || true
+                        kubectl -n "${NS}" get events --sort-by=.lastTimestamp | tail -n 50 || true
+
+                        echo "[smoke] --- pod describe (${P1}/${P2}) ---"
+                        kubectl -n "${NS}" describe pod "${P1}" || true
+                        kubectl -n "${NS}" describe pod "${P2}" || true
+
+                        echo "[smoke] --- kube-system critical pods snapshot ---"
+                        kubectl -n kube-system get pods -o wide | egrep 'aws-node|coredns|kube-proxy' || true
+
+                        echo "[smoke] NOTE: Full diagnostics were saved into artifacts/ (smoke-${NS}-*.txt)"
+                      }
+
+                      echo "[smoke] Finding 2 Ready nodes with free pod capacity..."
+
+                      # We need nodes that can accept at least 1 more pod. The failure we saw was:
+                      #   Node didn't have enough resource: pods, requested: 1, used: 58, capacity: 58
+                      # So we calculate: free = allocatablePods - usedPods.
+
+                      NODES_CANDIDATES_TMP="$(mktemp)"
+                      kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{print $1}' >"${NODES_CANDIDATES_TMP}" || true
+
+                      if [ ! -s "${NODES_CANDIDATES_TMP}" ]; then
+                        echo "[smoke] ERROR: No Ready nodes found"
+                        kubectl get nodes -o wide || true
+                        exit 1
+                      fi
+
+                      # Build a ranked list by free pod slots (descending)
+                      RANKED_TMP="$(mktemp)"
+                      while IFS= read -r n; do
+                        [ -n "${n}" ] || continue
+
+                        alloc_pods="$(kubectl get node "${n}" -o jsonpath='{.status.allocatable.pods}' 2>/dev/null || true)"
+                        # allocatable.pods is a string; ensure it's numeric
+                        case "${alloc_pods}" in
+                          ''|*[!0-9]*) alloc_pods=0 ;;
+                        esac
+
+                        used_pods="$(kubectl get pods -A --field-selector spec.nodeName="${n}" --no-headers 2>/dev/null | wc -l | tr -d ' ' || true)"
+                        case "${used_pods}" in
+                          ''|*[!0-9]*) used_pods=0 ;;
+                        esac
+
+                        free_pods=$((alloc_pods - used_pods))
+                        # Print: free node alloc used
+                        printf "%s\t%s\t%s\t%s\n" "${free_pods}" "${n}" "${alloc_pods}" "${used_pods}" >>"${RANKED_TMP}"
+                      done <"${NODES_CANDIDATES_TMP}"
+
+                      rm -f "${NODES_CANDIDATES_TMP}" || true
+
+                      echo "[smoke] Node pod-capacity ranking (free, node, alloc, used):"
+                      sort -nr "${RANKED_TMP}" | head -n 10 || true
+
+                      # Pick top 2 nodes that have at least 1 free pod slot
+                      NODE_A="$(sort -nr "${RANKED_TMP}" | awk '$1>0{print $2; exit}')"
+                      NODE_B="$(sort -nr "${RANKED_TMP}" | awk '$1>0{c++; if(c==2){print $2; exit}}')"
+
+                      rm -f "${RANKED_TMP}" || true
+
+                      if [ -z "${NODE_A}" ] || [ -z "${NODE_B}" ]; then
+                        echo "[smoke] ERROR: Need at least 2 Ready nodes with free pod slots (allocatable.pods > usedPods)."
+                        echo "[smoke] Hint: this usually means the cluster hit max pods per node; scale nodes or run smoke without pinning."
+                        kubectl get nodes -o wide || true
+                        # Show pod counts per node quickly (best-effort)
+                        kubectl get pods -A -o wide 2>/dev/null | awk 'NR>1{print $8}' | sort | uniq -c | sort -nr | head -n 20 || true
+                        exit 1
+                      fi
+
+                      echo "[smoke] Using nodes: A=${NODE_A}, B=${NODE_B}"
+
+                      NODE_A_IP="$(kubectl get node "${NODE_A}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+                      NODE_B_IP="$(kubectl get node "${NODE_B}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)"
+
+                      if [ -z "${NODE_A_IP}" ] || [ -z "${NODE_B_IP}" ]; then
+                        echo "[smoke] ERROR: Failed to detect node InternalIP"
+                        kubectl get node "${NODE_A}" -o wide || true
+                        kubectl get node "${NODE_B}" -o wide || true
+                        exit 1
+                      fi
+
+                      echo "[smoke] Creating pods pinned to nodes (selected with free pod slots)..."
+                      MANIFEST_TMP="$(mktemp)"
+                      cat >"${MANIFEST_TMP}" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${P1}
+  labels: {app: smoke-net}
+spec:
+  nodeName: ${NODE_A}
+  restartPolicy: Never
+  containers:
+    - name: netshoot
+      image: ${IMG}
+      command: ["sh","-c","sleep 3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${P2}
+  labels: {app: smoke-net}
+spec:
+  nodeName: ${NODE_B}
+  restartPolicy: Never
+  containers:
+    - name: netshoot
+      image: ${IMG}
+      command: ["sh","-c","sleep 3600"]
+EOF
+
+                      kubectl -n "${NS}" apply -f "${MANIFEST_TMP}"
+                      rm -f "${MANIFEST_TMP}" || true
+
+                      echo "[smoke] Waiting for pods to be Ready..."
+                      kubectl -n "${NS}" wait --for=condition=Ready pod/"${P1}" --timeout=180s || {
+                        dump_on_failure "timed out waiting for pod/${P1} to become Ready"
+                        exit 1
+                      }
+                      kubectl -n "${NS}" wait --for=condition=Ready pod/"${P2}" --timeout=180s || {
+                        dump_on_failure "timed out waiting for pod/${P2} to become Ready"
+                        exit 1
+                      }
+
+                      P1_IP="$(kubectl -n "${NS}" get pod "${P1}" -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+                      P2_IP="$(kubectl -n "${NS}" get pod "${P2}" -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+
+                      if [ -z "${P1_IP}" ] || [ -z "${P2_IP}" ]; then
+                        echo "[smoke] ERROR: Failed to get pod IPs"
+                        kubectl -n "${NS}" get pods -o wide || true
+                        exit 1
+                      fi
+
+                      echo "[smoke] Pod IPs: ${P1}=${P1_IP}, ${P2}=${P2_IP}"
+
+                      # Summary header (also persisted to artifacts)
+                      {
+                        echo "[smoke][summary] cluster=${CLUSTER_NAME} region=${AWS_REGION}"
+                        echo "[smoke][summary] namespace=${NS}"
+                        echo "[smoke][summary] nodeA=${NODE_A} nodeA_ip=${NODE_A_IP}"
+                        echo "[smoke][summary] nodeB=${NODE_B} nodeB_ip=${NODE_B_IP}"
+                        echo "[smoke][summary] podA=${P1} podA_ip=${P1_IP}"
+                        echo "[smoke][summary] podB=${P2} podB_ip=${P2_IP}"
+                      } | tee "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 1: DNS resolve from pod A..."
+                      kubectl -n "${NS}" exec "${P1}" -- sh -c 'getent hosts kubernetes.default.svc >/dev/null 2>&1 || nslookup kubernetes.default.svc >/dev/null 2>&1'
+                      echo "[smoke][summary] dns=ok" | tee -a "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 2: Pod-to-pod ping (A -> B)..."
+                      # Keep ping output for humans and also record a one-line status
+                      kubectl -n "${NS}" exec "${P1}" -- sh -c "ping -c 3 -W 2 ${P2_IP}"
+                      echo "[smoke][summary] pod_to_pod_ping=ok" | tee -a "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 3: Pod-to-node ping (A -> NodeB InternalIP)..."
+                      kubectl -n "${NS}" exec "${P1}" -- sh -c "ping -c 3 -W 2 ${NODE_B_IP}"
+                      echo "[smoke][summary] pod_to_node_ping=ok" | tee -a "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 4: Node kubelet port (A -> NodeB:10250) [optional]..."
+                      kubectl -n "${NS}" exec "${P1}" -- sh -c "nc -zvw3 ${NODE_B_IP} 10250"
+                      echo "[smoke][summary] kubelet_10250_tcp=ok" | tee -a "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 5: Pod-to-Service (ClusterIP) HTTP..."
+                      # Deploy a tiny HTTP endpoint and access it via Service DNS from pod A
+                      MANIFEST_SVC_TMP="$(mktemp)"
+                      cat >"${MANIFEST_SVC_TMP}" <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SVC_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${SVC_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${SVC_NAME}
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          args: ["netexec","--http-port=8080"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SVC_NAME}
+spec:
+  selector:
+    app: ${SVC_NAME}
+  ports:
+    - name: http
+      port: ${SVC_PORT}
+      targetPort: 8080
+EOF
+
+                      kubectl -n "${NS}" apply -f "${MANIFEST_SVC_TMP}"
+                      rm -f "${MANIFEST_SVC_TMP}" || true
+
+                      kubectl -n "${NS}" rollout status deploy/${SVC_NAME} --timeout=180s
+                      # Try curl first, fallback to wget; keep it simple and deterministic
+                      kubectl -n "${NS}" exec "${P1}" -- sh -c "(command -v curl >/dev/null 2>&1 && curl -fsS --max-time 5 http://${SVC_NAME}:${SVC_PORT}/ >/dev/null) || (command -v wget >/dev/null 2>&1 && wget -qO- --timeout=5 http://${SVC_NAME}:${SVC_PORT}/ >/dev/null)"
+                      echo "[smoke][summary] pod_to_service_http=ok service=${SVC_NAME}:${SVC_PORT}" | tee -a "${SUMMARY_FILE}"
+
+                      echo "[smoke] Test 6: MTU / DF check (A -> B pod IP)"
+                      # Validate that we can send near-MTU packets without fragmentation.
+                      # Typical Ethernet MTU 1500 => payload 1472 (1500 - 20 IP - 8 ICMP).
+                      MTU_OK="false"
+                      for SZ in 1472 1372 1272; do
+                        echo "[smoke] MTU attempt: size=${SZ} (DF)"
+                        if kubectl -n "${NS}" exec "${P1}" -- sh -c "ping -c 2 -W 2 -M do -s ${SZ} ${P2_IP}" >/dev/null 2>&1; then
+                          echo "[smoke] MTU OK with size=${SZ}"
+                          echo "[smoke][summary] mtu_df_ping=ok size=${SZ}" | tee -a "${SUMMARY_FILE}"
+                          MTU_OK="true"
+                          break
+                        fi
+                        # If this ping flavor doesn't support -M, the command will fail; try a smaller size with the same flags.
+                        # We keep it strict: if all sizes fail, we fail the smoke test.
+                      done
+
+                      if [ "${MTU_OK}" != "true" ]; then
+                        echo "[smoke] ERROR: MTU/DF ping failed for sizes 1472/1372/1272 (A -> B pod IP=${P2_IP})"
+                        echo "[smoke][summary] mtu_df_ping=failed" | tee -a "${SUMMARY_FILE}"
+                        exit 1
+                      fi
+
+                      echo "[smoke] Quick system pods snapshot (kube-system): coredns/aws-node/kube-proxy"
+                      # Best-effort: do not fail smoke test on listing issues
+                      kubectl -n kube-system get pods -o wide 2>/dev/null | egrep 'coredns|aws-node|kube-proxy' || true
+
+                      echo "[smoke] Nodes snapshot"
+                      kubectl get nodes -o wide || true
+
+                      # Persist short snapshots into artifacts directory
+                      {
+                        echo "[smoke][summary] kube_system_pods_snapshot=see_artifacts"
+                        echo "[smoke][summary] nodes_snapshot=see_artifacts"
+                      } | tee -a "${SUMMARY_FILE}" >/dev/null
+
+                      kubectl -n kube-system get pods -o wide 2>/dev/null | egrep 'coredns|aws-node|kube-proxy' >"artifacts/smoke-kube-system-pods-${NS}.txt" 2>&1 || true
+                      kubectl get nodes -o wide >"artifacts/smoke-nodes-${NS}.txt" 2>&1 || true
+
+                      echo "[smoke] OK: Networking smoke test passed. Summary saved to ${SUMMARY_FILE}"
+                    ''')
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      post {
+        always {
+          sh "chown -R ${userId}:${groupId} ."
+          archiveArtifacts artifacts: 'infrastructure/artifacts/**', onlyIfSuccessful: false, allowEmptyArchive: true
+          cleanWs()
+        }
+      }
+    }
+  }
+}

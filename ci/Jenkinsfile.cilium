@@ -1,0 +1,116 @@
+pipeline {
+    agent {
+        dockerfile {
+            filename 'ci/Dockerfile'
+            dir '.'
+            label 'csdac-prod'
+            registryUrl 'https://dockerhub.cisco.com'
+            registryCredentialsId 'cisco-dockerhub-id'
+            args '-u root -it -v /root/.kube:/root/.kube'
+        }
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        ansiColor('xterm')
+    }
+    parameters {
+        string(
+           name: 'AWS_CREDS',
+           defaultValue: "TERRAFORM_CSDAC",
+           description: "AWS credentials ID"
+        )
+        choice(
+            name: 'CLUSTER',
+            choices: [
+                'csdac-dev-cluster:us-west-1',
+                'csdac-qa-cluster:us-west-1',
+                'csdac-staging-cluster:us-west-1',
+                'csdac-prodeu-cluster:eu-central-1',
+                'csdac-prodapj-cluster:ap-northeast-1',
+                'csdac-prodaus-cluster:ap-southeast-2',
+                'csdac-prodin-cluster:ap-south-1',
+                'csdac-prod-cluster:us-west-1',
+                'cilium-poc-cluster:us-west-1',
+                'csdac-fips-cluster:us-west-2',
+                'csdac-staging-cluster:us-gov-west-1',
+                'csdac-stgfed-cluster:us-gov-west-1'
+            ],
+            description: 'Choose cluster.'
+        )
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    sleep 1
+                }
+            }
+        }
+        stage('Check CREDS'){
+            steps{
+                script {
+                    CREDS_ID = "${params.AWS_CREDS}"
+                    println "Using AWS Credentials: ${CREDS_ID}"
+                }
+            }
+        }
+        stage('AWS CLI Check') {
+            steps {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                                                  credentialsId: CREDS_ID,
+                                                                  usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                                                  passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                    script{
+                        try {
+                            def region = params.CLUSTER.split(':')[1]
+                            sh "aws sts get-caller-identity --region ${region}"
+                        } catch (Exception e) {
+                            echo "Failed to get AWS caller identity: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            error("AWS CLI check failed.")
+                        }
+                    }
+                    }
+            }
+        }
+        stage('Installation cilium') {
+            steps {
+                script {
+                timeout(time: 10, unit: "MINUTES") {
+                    input message: "Approve install cilium for ${params.CLUSTER}?", ok: "Yes"
+                }
+                dir('ci/scripts') {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                              credentialsId: CREDS_ID,
+                                              usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                              passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        script {
+                            def cluster = params.CLUSTER.split(':')[0]
+                            def region = params.CLUSTER.split(':')[1]
+                            def secretName = 'cilium-ipsec-keys'
+                            def namespace = 'kube-system'
+                                sh "aws eks update-kubeconfig --region ${region} --name ${cluster}"
+                                sh "kubectl config current-context"
+                                try{
+                                    sh '''
+                                    kubectl create -n kube-system secret generic cilium-ipsec-keys --from-literal=keys="3+ rfc4106(gcm(aes)) $(echo $(dd if=/dev/urandom count=20 bs=1 2> /dev/null | xxd -p -c 64)) 128" 
+                                    '''
+                                }catch (err) {
+                                    echo "${err}"
+                                }
+                                try{
+                                    sh "helm repo add cilium https://helm.cilium.io/"
+                                    sh "helm install cilium cilium/cilium --version 1.16.0 --namespace kube-system --set encryption.enabled=true --set encryption.type=ipsec"
+                                }catch(err){
+                                    echo "${err}"
+                                }
+                        }
+                    }
+                }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,896 @@
+def userId
+def groupId
+def CREDS_ID
+// Canonical mapping of ENVIRONMENT → { region, creds }
+def ENV_MAP = [
+  dev    : [region: 'us-west-1',    creds: 'TERRAFORM_CSDAC'],
+  ci     : [region: 'us-west-1',    creds: 'TERRAFORM_CSDAC'],
+  staging: [region: 'us-west-1',    creds: 'TERRAFORM_CSDAC'],
+  qa     : [region: 'us-west-1',    creds: 'TERRAFORM_CSDAC'],
+  prod   : [region: 'us-west-1',    creds: 'TERRAFORM_CSDAC_PROD'],
+  prodeu : [region: 'eu-central-1', creds: 'TERRAFORM_CSDAC_PROD'],
+  prodapj: [region: 'ap-northeast-1', creds: 'TERRAFORM_CSDAC_PROD'],
+  prodaus: [region: 'ap-southeast-2', creds: 'TERRAFORM_CSDAC_PROD'],
+  prodin : [region: 'ap-south-1',  creds: 'TERRAFORM_CSDAC_PROD'],
+  produae: [region: 'me-central-1',  creds: 'TERRAFORM_CSDAC_PROD']
+]
+
+pipeline {
+    agent { label 'csdac-prod' }
+
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '5'))
+        timeout(time: 2, unit: 'HOURS')
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: 'dev\nqa\nci\nstaging\nprod\nprodeu\nprodapj\nprodaus\nprodin\nproduae',
+            description: 'Target environment. Region & AWS credentials are derived automatically.'
+        )
+        choice(
+            name: 'ACTION',
+            choices: "apply\ndestroy",
+            description: "Terraform action, Apply/Destroy"
+        )
+        string(
+            name: 'TF_STACK',
+            defaultValue: "",
+            description: '''Stack to apply. Leave empty to deploy all (recommended order: extra → vpc → routes → database → messaging → compute → eks).
+        Note:
+        - 'extra' is only needed when deploying 'eks'
+        - 'vpc' is required before 'eks' or 'compute'
+        - 'routes' must be applied before 'compute'
+        - You can deploy 'database', 'messaging', or 'routes' separately if needed'''
+        )
+        booleanParam(
+            name: 'TF_PLAN',
+            defaultValue: true,
+            description: 'Run terraform plan before apply/destroy'
+        )
+        booleanParam(
+            name: 'CREATE_KEY',
+            defaultValue: false,
+            description: 'Do I need to create a new SSH key pair(Required for the first time for a new region)'
+        )
+        booleanParam(
+            name: 'RUN_IMPORT',
+            defaultValue: false,
+            description: 'Run one-time Terraform import for existing MariaDB/MySQL primary if it is not in state yet'
+        )
+        booleanParam(
+            name: 'RUN_STATE_MIGRATE',
+            defaultValue: false,
+            description: 'Safely migrate Terraform state addresses from legacy module paths (module.db/module.mariadb) to keyed paths (module.db["primary"], module.mariadb["primary"]). Use when plan shows destroy of RDS under old addresses.'
+        )
+        booleanParam(
+            name: 'RUN_LEGACY_MIGRATE',
+            defaultValue: false,
+            description: 'One-time: move aws_instance.cylon["3"] → aws_instance.cylon_legacy[0] in compute stack, and remove unmanaged aws_security_group.cylon from VPC stack state (prevents unintended destroys).'
+        )
+        string(
+            name: 'KEY_NAME',
+            defaultValue: '',
+            description: 'Only for prod use cylon-ass-us-west-1 (For other regions, leave the field blank. default: ${ENVIRONMENT}-cylon)'
+        )
+    }
+
+    stages {
+        stage('Get User info') {
+            steps {
+                script {
+                    userId = sh(script: "id -u", returnStdout: true).trim()
+                    groupId = sh(script: "id -g", returnStdout: true).trim()
+                    echo "USER ${userId}:${groupId}"
+                }
+            }
+        }
+
+        stage('Build inside Docker') {
+            agent {
+                dockerfile {
+                    filename 'ci/Dockerfile'
+                    dir '.'
+                    label 'csdac-prod'
+                    args "-u root"
+                }
+            }
+
+            stages {
+                stage('Terraspace bundle') {
+                    steps {
+                        script {
+                            def cfg = ENV_MAP[params.ENVIRONMENT]
+                            if (!cfg) {
+                                error "Unknown ENVIRONMENT '${params.ENVIRONMENT}'. Allowed: ${ENV_MAP.keySet().join(', ')}"
+                            }
+                            CREDS_ID = cfg.creds
+                            env.DERIVED_AWS_REGION = cfg.region
+                            echo "Using AWS Credentials: ${CREDS_ID}"
+                            echo "Region: ${env.DERIVED_AWS_REGION}"
+
+                            withCredentials([string(credentialsId: 'fedramp_staging_ansible_user_key', variable: 'PUBLIC_KEY')]) {
+                                env.ANSIBLE_PUBLIC_KEY = PUBLIC_KEY
+                            }
+                        }
+
+                        dir('infrastructure_cylon') {
+                            sh "bundle install"
+                            sh "terraspace clean all --yes"
+                            sh "terraspace bundle"
+                        }
+                    }
+                }
+
+                stage('Validate Key') {
+                    when {
+                        allOf {
+                            expression { params.TF_STACK?.trim() == "compute" }
+                            expression { params.ACTION == "apply" }
+                        }
+                    }
+                    steps {
+                        withCredentials([[
+                            $class: 'UsernamePasswordMultiBinding',
+                            credentialsId: CREDS_ID,
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            script {
+                                // def keyName = "${params.ENVIRONMENT}-cylon"
+                                def keyName = params.KEY_NAME?.trim() ? params.KEY_NAME.trim() : "${params.ENVIRONMENT}-cylon"
+                                def describeCmd = "aws ec2 describe-key-pairs --key-names ${keyName} --region ${env.DERIVED_AWS_REGION}"
+
+                                echo "🔍 Checking if key '${keyName}' exists in AWS..."
+
+                                def result = sh(script: "${describeCmd}", returnStatus: true)
+                                def output = sh(script: "${describeCmd} || true", returnStdout: true).trim()
+
+                                echo "🧪 AWS CLI output:\n${output}"
+                                echo "🔎 Command exit code: ${result}"
+
+                                if (params.CREATE_KEY) {
+                                    if (result == 0) {
+                                        error "❌ SSH key '${keyName}' already exists in AWS. Uncheck CREATE_KEY and re-run job."
+                                    } else {
+                                        echo "✅ Key '${keyName}' not found — safe to create."
+                                    }
+                                } else {
+                                    if (result == 0) {
+                                        echo "✅ Key '${keyName}' exists — will be used."
+                                    } else {
+                                        error "❌ SSH key '${keyName}' not found in AWS. Please mark CREATE_KEY checkbox to create it."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Import MariaDB primary into state') {
+                    when { expression { return params.RUN_IMPORT } }
+                    steps {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        withEnv(["TS_ENV=${params.ENVIRONMENT}", "AWS_REGION=${env.DERIVED_AWS_REGION}"]) {
+                                dir('infrastructure_cylon') {
+                                    sh '''#!/usr/bin/env bash
+                                        set -euo pipefail
+
+                                        # Build Terraspace cache and initialize dependent stacks so remote state reads work
+                                        terraspace build vpc
+                                        [ -d .terraspace-cache ] && chmod -R 777 .terraspace-cache || true
+
+                                        # Initialize VPC stack (needed for remote state pull of dependencies)
+                                        VPC_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/vpc"
+                                        if [ -d "$VPC_DIR" ]; then
+                                          terraform -chdir="$VPC_DIR" init -input=false -no-color || true
+                                        fi
+
+                                        # Build database after VPC is initialized so remote state pull succeeds
+                                        terraspace build database
+
+                                        # 1) Identify existing resource identifiers in AWS
+                                        DB_ID="${TS_ENV}-cylon-mariadb"
+
+                                        # Parameter Group (takes the first one starting with the prefix)
+                                        PG_NAME=$(aws rds describe-db-parameter-groups \
+                                          --query "DBParameterGroups[?starts_with(DBParameterGroupName, '${TS_ENV}-cylon-mariadb')].DBParameterGroupName | [0]" \
+                                          --output text)
+
+                                        # Option Group
+                                        OG_NAME=$(aws rds describe-option-groups --engine-name mariadb \
+                                          --query "OptionGroupsList[?starts_with(OptionGroupName, '${TS_ENV}-cylon-mariadb')].OptionGroupName | [0]" \
+                                          --output text)
+
+                                        echo "DB_ID=${DB_ID}"
+                                        echo "PG_NAME=${PG_NAME}"
+                                        echo "OG_NAME=${OG_NAME}"
+
+                                        # Resolve AWS account ID for policy ARN construction
+                                        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+                                        # Discover MySQL parameter/option groups (by prefix)
+                                        MYSQL_PG_NAME=$(aws rds describe-db-parameter-groups \
+                                          --query "DBParameterGroups[?starts_with(DBParameterGroupName, '${TS_ENV}-cylon-mysql')].DBParameterGroupName | [0]" \
+                                          --output text)
+
+                                        MYSQL_OG_NAME=$(aws rds describe-option-groups --engine-name mysql \
+                                          --query "OptionGroupsList[?starts_with(OptionGroupName, '${TS_ENV}-cylon-mysql')].OptionGroupName | [0]" \
+                                          --output text)
+
+                                        echo "MYSQL_PG_NAME=${MYSQL_PG_NAME}"
+                                        echo "MYSQL_OG_NAME=${MYSQL_OG_NAME}"
+
+                                        # Try to detect existing Enhanced Monitoring role name from common candidates
+                                        MON_ROLE=""
+                                        for r in "${TS_ENV}-cylon-rds-monitoring-role" "rds-monitoring-role" "${TS_ENV}-cylon"; do
+                                          if aws iam get-role --role-name "$r" >/dev/null 2>&1; then
+                                            MON_ROLE="$r"; break
+                                          fi
+                                        done
+                                        echo "MON_ROLE=${MON_ROLE:-<not-found>}"
+
+                                        # Initialize Database stack working dir and import directly with terraform to preserve ["primary"]
+                                        DB_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/database"
+                                        if [ ! -d "$DB_DIR" ]; then
+                                          echo "ERROR: Database cache dir not found at $DB_DIR" >&2
+                                          exit 1
+                                        fi
+                                        terraform -chdir="$DB_DIR" init -input=false -no-color || true
+
+                                        # Helper: import only if address is not yet in state
+                                        import_if_missing() {
+                                          local addr="$1"; shift
+                                          local id="$1"; shift || true
+                                          if terraform -chdir="$DB_DIR" state show "$addr" >/dev/null 2>&1; then
+                                            echo "SKIP: already managed by Terraform → $addr"
+                                          else
+                                            echo "IMPORT: $addr ← $id"
+                                            terraform -chdir="$DB_DIR" import "$addr" "$id"
+                                          fi
+                                        }
+
+                                        import_if_missing 'module.mariadb["primary"].module.db_instance.aws_db_instance.this[0]' "${DB_ID}"
+
+                                        if [ "${PG_NAME}" != "None" ] && [ "${PG_NAME}" != "null" ] && [ -n "${PG_NAME}" ]; then
+                                          import_if_missing 'module.mariadb["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]' "${PG_NAME}"
+                                        fi
+
+                                        if [ "${OG_NAME}" != "None" ] && [ "${OG_NAME}" != "null" ] && [ -n "${OG_NAME}" ]; then
+                                          import_if_missing 'module.mariadb["primary"].module.db_option_group.aws_db_option_group.this[0]' "${OG_NAME}"
+                                        fi
+
+                                        # === MySQL (primary) ===
+                                        # 1) Instance itself
+                                        import_if_missing 'module.db["primary"].module.db_instance.aws_db_instance.this[0]' "${TS_ENV}-cylon-mysql"
+
+                                        # 2) Parameter group (if discovered)
+                                        if [ "${MYSQL_PG_NAME}" != "None" ] && [ "${MYSQL_PG_NAME}" != "null" ] && [ -n "${MYSQL_PG_NAME}" ]; then
+                                          import_if_missing 'module.db["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]' "${MYSQL_PG_NAME}"
+                                        else
+                                          echo "WARN: MySQL Parameter Group not found for prefix '${TS_ENV}-cylon-mysql' — skipping import"
+                                        fi
+
+                                        # 3) Option group (if discovered)
+                                        if [ "${MYSQL_OG_NAME}" != "None" ] && [ "${MYSQL_OG_NAME}" != "null" ] && [ -n "${MYSQL_OG_NAME}" ]; then
+                                          import_if_missing 'module.db["primary"].module.db_option_group.aws_db_option_group.this[0]' "${MYSQL_OG_NAME}"
+                                        else
+                                          echo "WARN: MySQL Option Group not found for prefix '${TS_ENV}-cylon-mysql' — skipping import"
+                                        fi
+
+                                        # 4) Enhanced Monitoring IAM Role (auto: import only if module expects to manage it)
+                                        # Helper: check if a resource address exists in CONFIG (not state) by attempting a targeted plan
+                                        resource_in_config() {
+                                          local addr="$1"
+                                          terraform -chdir="$DB_DIR" plan -target="$addr" -refresh=false -input=false -no-color -out=/dev/null >/dev/null 2>&1
+                                        }
+
+                                        # New address the module would use if it manages the role
+                                        MON_ADDR_ROLE='module.db["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]'
+                                        MON_ADDR_ATTACH='module.db["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]'
+
+                                        if resource_in_config "$MON_ADDR_ROLE"; then
+                                          echo "INFO: Module expects to manage Enhanced Monitoring role → will reconcile state."
+                                          if [ -n "${MON_ROLE}" ]; then
+                                            import_if_missing "$MON_ADDR_ROLE"   "${MON_ROLE}"
+                                            import_if_missing "$MON_ADDR_ATTACH" "${MON_ROLE}/arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+                                          else
+                                            echo "WARN: Module expects Monitoring role, but no role found in AWS by common names — Terraform will create it if allowed by inputs."
+                                          fi
+                                        else
+                                          echo "INFO: Module is NOT configured to manage Enhanced Monitoring role → skipping import."
+                                        fi
+
+                                        # 6) Policy Secrets read (global resource in stack)
+                                        POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/${TS_ENV}-cylon-db-ro-secrets"
+                                        if aws iam get-policy --policy-arn "${POLICY_ARN}" >/dev/null 2>&1; then
+                                          import_if_missing 'aws_iam_policy.cylon_db_ro_policy' "${POLICY_ARN}"
+                                        else
+                                          echo "WARN: Policy ${POLICY_ARN} not found — skipping import"
+                                        fi
+                                        '''
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('State audit (after import)') {
+                    when { expression { return params.RUN_IMPORT } }
+                    steps {
+                        withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                                        credentialsId: CREDS_ID,
+                                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                        passwordVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            withEnv(["TS_ENV=${params.ENVIRONMENT}", "AWS_REGION=${env.DERIVED_AWS_REGION}"]) {
+                                dir('infrastructure_cylon') {
+                                    sh '''#!/usr/bin/env bash
+                                        set -euo pipefail
+                                        STACK=database
+
+                                        echo "==> Build cache so we can access terraform dir"
+                                        terraspace build vpc
+                                        [ -d .terraspace-cache ] && chmod -R 777 .terraspace-cache || true
+
+                                        # Initialize VPC stack so Terraspace can pull remote state
+                                        VPC_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/vpc"
+                                        if [ -d "$VPC_DIR" ]; then
+                                          terraform -chdir="$VPC_DIR" init -input=false -no-color || true
+                                        fi
+
+                                        # Now build the database stack after VPC init
+                                        terraspace build "${STACK}"
+
+                                        echo "==> Locate Terraform working dir inside Terraspace cache"
+                                        REGION_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/${STACK}"
+                                        if [ ! -d "${REGION_DIR}" ]; then
+                                          REGION_DIR=$(ls -d .terraspace-cache/*/*/stacks/${STACK} 2>/dev/null | head -n1 || true)
+                                        fi
+                                        if [ -z "${REGION_DIR}" ] || [ ! -d "${REGION_DIR}" ]; then
+                                          echo "ERROR: Terraform cache dir not found (tried primary and fallback)" >&2
+                                          exit 1
+                                        fi
+                                        echo "Terraform dir: ${REGION_DIR}"
+
+                                        echo "==> terraform state list"
+                                        terraform -chdir="${REGION_DIR}" state list | tee state_list.txt
+
+                                        echo "==> Filter: mariadb-related entries"
+                                        echo "---- module.mariadb entries ----"
+                                        grep -E '^module\\.mariadb(\\["[^"]+"\\])?\\.' state_list.txt || true
+                                        echo "---- module.db (MySQL) entries ----"
+                                        grep -E '^module\\.db\\.' state_list.txt || true
+
+                                        echo "==> Quick counts"
+                                        echo "TOTAL: $(wc -l < state_list.txt) resources in state"
+                                        echo "MARIADB: $(grep -E '^module\\.mariadb(\\[\"[^\"]+\"\\])?\\.' state_list.txt | wc -l | tr -d " ")"
+                                        echo "MYSQL  : $(grep -E '^module\\.db\\.' state_list.txt | wc -l | tr -d " ")"
+
+                                        echo "==> (Optional) Show details for primary MariaDB instance"
+                                        PRI_INST='module.mariadb["primary"].module.db_instance.aws_db_instance.this[0]'
+                                        if grep -q "${PRI_INST}" state_list.txt; then
+                                          terraform -chdir="${REGION_DIR}" state show "${PRI_INST}" | sed -n '1,80p'
+                                        fi
+                                        '''
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Migrate Legacy EC2/SG in state') {
+                    when { expression { return params.RUN_LEGACY_MIGRATE } }
+                    steps {
+                        withCredentials([[
+                            $class: 'UsernamePasswordMultiBinding',
+                            credentialsId: CREDS_ID,
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            withEnv(["TS_ENV=${params.ENVIRONMENT}", "AWS_REGION=${env.DERIVED_AWS_REGION}"]) {
+                                dir('infrastructure_cylon') {
+                                    sh '''#!/usr/bin/env bash
+                                        set -euo pipefail
+
+                                        echo "==> Build VPC and compute stacks into Terraspace cache"
+                                        terraspace build vpc
+                                        terraspace build compute
+
+                                        # Compute stack dir
+                                        COMP_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/compute"
+                                        if [ ! -d "$COMP_DIR" ]; then
+                                          echo "ERROR: Compute cache dir not found at $COMP_DIR" >&2
+                                          exit 1
+                                        fi
+                                        terraform -chdir="$COMP_DIR" init -input=false -no-color || true
+
+                                        # Helper: remove SG address from a given stack dir if present
+                                        remove_sg_if_present() {
+                                          local dir="$1"
+                                          local addr='aws_security_group.cylon'
+                                          if [ -d "$dir" ]; then
+                                            terraform -chdir="$dir" init -input=false -no-color || true
+                                            if terraform -chdir="$dir" state show "$addr" >/dev/null 2>&1; then
+                                              echo "CLEAN: removing unmanaged resource from state in $(basename "$dir") → $addr"
+                                              terraform -chdir="$dir" state rm "$addr"
+                                            else
+                                              echo "SKIP: SG address not present in state for $(basename "$dir") → $addr"
+                                            fi
+                                          else
+                                            echo "WARN: stack dir not found: $dir"
+                                          fi
+                                        }
+
+                                        # Move aws_instance.cylon["3"] -> aws_instance.cylon_legacy[0] if needed
+                                        SRC='aws_instance.cylon["3"]'
+                                        DST='aws_instance.cylon_legacy[0]'
+                                        if terraform -chdir="$COMP_DIR" state show "$DST" >/dev/null 2>&1; then
+                                          echo "SKIP: destination already exists → $DST"
+                                        else
+                                          if terraform -chdir="$COMP_DIR" state show "$SRC" >/dev/null 2>&1; then
+                                            echo "MOVE: $SRC → $DST"
+                                            terraform -chdir="$COMP_DIR" state mv "$SRC" "$DST"
+                                          else
+                                            echo "SKIP: source not found in state → $SRC"
+                                          fi
+                                        fi
+
+                                        # Try removing SG from both compute and vpc stacks (legacy might be in either)
+                                        echo "==> SG state cleanup in compute and vpc stacks (whichever has it)"
+                                        remove_sg_if_present "$COMP_DIR"
+
+                                        # VPC stack dir
+                                        VPC_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/vpc"
+                                        [ -d "$VPC_DIR" ] || terraspace build vpc || true
+                                        remove_sg_if_present "$VPC_DIR"
+                                    '''
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Migrate TF state addresses (db/mariadb → ["primary"])') {
+                    when { expression { return params.RUN_STATE_MIGRATE } }
+                    steps {
+                      withCredentials([[
+                        $class: 'UsernamePasswordMultiBinding',
+                        credentialsId: CREDS_ID,
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                      ]]) {
+                        withEnv(["TS_ENV=${params.ENVIRONMENT}", "AWS_REGION=${env.DERIVED_AWS_REGION}"]) {
+                          dir('infrastructure_cylon') {
+                            sh '''#!/usr/bin/env bash
+                              set -euo pipefail
+
+                              echo "==> Build VPC stack into Terraspace cache (for remote state deps)"
+                              terraspace build vpc
+                              VPC_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/vpc"
+                              if [ -d "$VPC_DIR" ]; then
+                                terraform -chdir="$VPC_DIR" init -input=false -no-color || true
+                              fi
+
+                              echo "==> Build database stack into Terraspace cache"
+                              terraspace build database
+
+                              DB_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/database"
+                              if [ ! -d "$DB_DIR" ]; then
+                                echo "ERROR: Database cache dir not found at $DB_DIR" >&2
+                                exit 1
+                              fi
+
+                              terraform -chdir="$DB_DIR" init -input=false -no-color || true
+
+                              mv_if_needed() {
+                                local from="$1"; shift
+                                local to="$1"; shift
+                                if terraform -chdir="$DB_DIR" state show "$to" >/dev/null 2>&1; then
+                                  echo "SKIP: dest already exists → $to"
+                                  return 0
+                                fi
+                                if terraform -chdir="$DB_DIR" state show "$from" >/dev/null 2>&1; then
+                                  echo "MOVE: $from → $to"
+                                  terraform -chdir="$DB_DIR" state mv "$from" "$to"
+                                else
+                                  echo "SKIP: source not found → $from"
+                                fi
+                              }
+
+                              # Check if a resource address exists in CONFIG (not only in state)
+                              resource_in_config() {
+                                local addr="$1"
+                                terraform -chdir="$DB_DIR" plan -target="$addr" -refresh=false -input=false -no-color -out=/dev/null >/dev/null 2>&1
+                              }
+
+                              # If both old and new addresses exist and point to the same backend id, remove the old one from state
+                              dedupe_if_same_id() {
+                                local from="$1"; shift
+                                local to="$1"; shift
+
+                                if ! terraform -chdir="$DB_DIR" state show "$to" >/dev/null 2>&1; then
+                                  return 0
+                                fi
+                                if ! terraform -chdir="$DB_DIR" state show "$from" >/dev/null 2>&1; then
+                                  return 0
+                                fi
+
+                                local from_id to_id
+                                from_id=$(terraform -chdir="$DB_DIR" state show "$from" | awk '/^ +id += /{print $3; exit}')
+                                to_id=$(terraform -chdir="$DB_DIR" state show "$to" | awk '/^ +id += /{print $3; exit}')
+
+                                if [ -n "$from_id" ] && [ "$from_id" = "$to_id" ]; then
+                                  echo "DEDUPE: removing legacy address from state (kept new) → $from (id=$from_id)"
+                                  terraform -chdir="$DB_DIR" state rm "$from"
+                                else
+                                  echo "INFO: skip dedupe; ids differ (from=$from_id, to=$to_id) for $from"
+                                fi
+                              }
+
+                              # If a resource exists in state but is NOT present in config (e.g., module count=0), remove it from state to avoid destroy
+                              remove_if_unmanaged() {
+                                local addr="$1"
+                                if terraform -chdir="$DB_DIR" state show "$addr" >/dev/null 2>&1; then
+                                  if ! resource_in_config "$addr"; then
+                                    echo "CLEAN: removing unmanaged resource from state → $addr"
+                                    terraform -chdir="$DB_DIR" state rm "$addr"
+                                  fi
+                                fi
+                              }
+
+                              echo "==> MySQL (module.db)MySQL (module.db)"
+                              mv_if_needed 'module.db.module.db_instance.aws_db_instance.this[0]' \
+                                            'module.db["primary"].module.db_instance.aws_db_instance.this[0]'
+                              dedupe_if_same_id 'module.db.module.db_instance.aws_db_instance.this[0]' 'module.db["primary"].module.db_instance.aws_db_instance.this[0]'
+                              mv_if_needed 'module.db.module.db_parameter_group.aws_db_parameter_group.this[0]' \
+                                            'module.db["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]'
+                              dedupe_if_same_id 'module.db.module.db_parameter_group.aws_db_parameter_group.this[0]' 'module.db["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]'
+                              mv_if_needed 'module.db.module.db_option_group.aws_db_option_group.this[0]' \
+                                            'module.db["primary"].module.db_option_group.aws_db_option_group.this[0]'
+                              dedupe_if_same_id 'module.db.module.db_option_group.aws_db_option_group.this[0]' 'module.db["primary"].module.db_option_group.aws_db_option_group.this[0]'
+                              mv_if_needed 'module.db.module.db_instance.aws_iam_role.enhanced_monitoring[0]' \
+                                            'module.db["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]'
+                              dedupe_if_same_id 'module.db.module.db_instance.aws_iam_role.enhanced_monitoring[0]' 'module.db["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]'
+                              mv_if_needed 'module.db.module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]' \
+                                            'module.db["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]'
+                              dedupe_if_same_id 'module.db.module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]' 'module.db["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]'
+
+                              # Move Enhanced Monitoring IAM role/attachment from module-managed address to shared stack-level resources
+                              mv_if_needed 'module.db["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]' \
+                                            'aws_iam_role.rds_monitoring'
+                              mv_if_needed 'module.db["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]' \
+                                            'aws_iam_role_policy_attachment.rds_monitoring'
+
+                              echo "==> MariaDB (module.mariadb)"
+                              mv_if_needed 'module.mariadb.module.db_instance.aws_db_instance.this[0]' \
+                                            'module.mariadb["primary"].module.db_instance.aws_db_instance.this[0]'
+                              dedupe_if_same_id 'module.mariadb.module.db_instance.aws_db_instance.this[0]' 'module.mariadb["primary"].module.db_instance.aws_db_instance.this[0]'
+                              mv_if_needed 'module.mariadb.module.db_parameter_group.aws_db_parameter_group.this[0]' \
+                                            'module.mariadb["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]'
+                              dedupe_if_same_id 'module.mariadb.module.db_parameter_group.aws_db_parameter_group.this[0]' 'module.mariadb["primary"].module.db_parameter_group.aws_db_parameter_group.this[0]'
+                              mv_if_needed 'module.mariadb.module.db_option_group.aws_db_option_group.this[0]' \
+                                            'module.mariadb["primary"].module.db_option_group.aws_db_option_group.this[0]'
+                              dedupe_if_same_id 'module.mariadb.module.db_option_group.aws_db_option_group.this[0]' 'module.mariadb["primary"].module.db_option_group.aws_db_option_group.this[0]'
+
+                              # (If existed historically) move Enhanced Monitoring IAM role/attachment from MariaDB module address to shared resources
+                              mv_if_needed 'module.mariadb["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]' \
+                                            'aws_iam_role.rds_monitoring'
+                              mv_if_needed 'module.mariadb["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]' \
+                                            'aws_iam_role_policy_attachment.rds_monitoring'
+
+                              echo "==> Cleanup unmanaged Enhanced Monitoring IAM resources (if any)"
+                              remove_if_unmanaged 'module.db["primary"].module.db_instance.aws_iam_role.enhanced_monitoring[0]'
+                              remove_if_unmanaged 'module.db["primary"].module.db_instance.aws_iam_role_policy_attachment.enhanced_monitoring[0]'
+
+                              echo "==> Show final state addresses for db/mariadb"
+                              terraform -chdir="$DB_DIR" state list | grep -E '^(module[.]db|module[.]mariadb)' || true
+                            '''
+                          }
+                        }
+                      }
+                    }
+                }
+
+                stage('Terraform Plan') {
+                    when {
+                        expression { params.TF_PLAN }
+                    }
+                    steps {
+                        dir('infrastructure_cylon') {
+                            withCredentials([[
+                                $class: 'UsernamePasswordMultiBinding',
+                                credentialsId: CREDS_ID,
+                                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                            ]]) {
+                                script {
+                                    def planCmds = []
+
+                                    if (params.TF_STACK?.trim()) {
+                                        def stack = params.TF_STACK.trim()
+                                        echo "Running terraform plan for stack: ${stack}"
+                                        planCmds << "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace plan ${stack}"
+                                    } else {
+                                        // Plan for all stacks except compute
+                                        def excluded = "compute"
+                                        def stacks = sh(
+                                            script: "terraspace list -t stack | grep -v ${excluded}",
+                                            returnStdout: true
+                                        ).trim().split("\n").collect { it.trim().tokenize('/').last() }.findAll { it }
+
+                                        for (s in stacks) {
+                                            echo "Planning: ${s}"
+                                            planCmds << "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace plan ${s}"
+                                        }
+
+                                        // Separately compute (with create_key)
+                                        def computePlan = "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace plan compute -var create_key=${params.CREATE_KEY}"
+                                        echo "Planning compute: ${computePlan}"
+                                        planCmds << computePlan
+                                    }
+
+                                    for (cmd in planCmds) {
+                                        echo "Running: ${cmd}"
+                                        sh cmd
+                                    }
+                                }
+                            }
+
+                            sh "cat log/plan/*.log || true"
+                        }
+                    }
+                }
+
+                stage("Terraform Action") {
+                    steps {
+                        script {
+                            timeout(time: 10, unit: "MINUTES") {
+                                input message: "Approve ${params.ACTION} for ${params.ENVIRONMENT}?", ok: "Yes"
+                            }
+
+                            dir('infrastructure_cylon') {
+                                withCredentials([[
+                                    $class: 'UsernamePasswordMultiBinding',
+                                    credentialsId: CREDS_ID,
+                                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                                ]]) {
+                                    def action = params.ACTION == "apply" ? "up" : "down"
+                                    echo "Mapped action: ${params.ACTION} → ${action}"
+
+                                    // Print AWS identity
+                                    sh "aws sts get-caller-identity"
+
+                                    if (params.TF_STACK?.trim()) {
+                                        // ✅ If specific stack is provided — run only it
+                                        def stack = params.TF_STACK.trim()
+                                        echo "Running Terraspace ${action} on stack: ${stack}"
+                                        sh "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace ${action} ${stack} --yes"
+                                    } else {
+                                        // 🔁 Otherwise run all stacks except compute
+                                        def excluded = "compute"
+                                        def stacks = sh(
+                                            script: "terraspace list -t stack | grep -v ${excluded}",
+                                            returnStdout: true
+                                        ).trim().split("\n").collect { it.trim().tokenize('/').last() }.findAll { it }
+
+                                        for (s in stacks) {
+                                            echo "Running Terraspace ${action} on ${s}"
+                                            sh "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace ${action} ${s} --yes"
+                                        }
+
+                                        // 2. Run compute with key creation flag
+                                        def computeCmd = "TS_ENV=${params.ENVIRONMENT} AWS_REGION=${env.DERIVED_AWS_REGION} terraspace ${params.ACTION} compute -var create_key=${params.CREATE_KEY} --yes"
+                                        echo "Running compute: ${computeCmd}"
+                                        sh computeCmd
+                                    }
+                                }
+
+                                try {
+                                    sh "cat log/up/*.log || true"
+                                } catch (e) {
+                                    echo "Error while browsing log files: ${e.message}"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Post-Apply Refresh & Outputs') {
+                    when {
+                        allOf {
+                            expression { params.ACTION == "apply" }
+                            expression { params.TF_STACK?.trim() == "" || params.TF_STACK?.trim() == "database" }
+                        }
+                    }
+                    steps {
+                        dir('infrastructure_cylon') {
+                            withCredentials([[
+                                $class: 'UsernamePasswordMultiBinding',
+                                credentialsId: CREDS_ID,
+                                usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                            ]]) {
+                                withEnv(["TS_ENV=${params.ENVIRONMENT}", "AWS_REGION=${env.DERIVED_AWS_REGION}"]) {
+                                    sh '''#!/usr/bin/env bash
+                                        set -euo pipefail
+
+                                        # Rebuild DB stack cache to ensure correct working dir
+                                        terraspace build database
+
+                                        DB_DIR=".terraspace-cache/${AWS_REGION}/${TS_ENV}/stacks/database"
+                                        if [ ! -d "$DB_DIR" ]; then
+                                          echo "ERROR: Database cache dir not found at $DB_DIR" >&2
+                                          exit 1
+                                        fi
+
+                                        # Make sure terraform is initialized
+                                        terraform -chdir="$DB_DIR" init -input=false -no-color || true
+
+                                        echo "==> Refreshing state to sync outputs with actual AWS values"
+                                        # Try refresh-only (newer TF), fall back to refresh on older TF
+                                        terraform -chdir="$DB_DIR" apply -refresh-only -auto-approve -no-color 2>/dev/null || \
+                                        terraform -chdir="$DB_DIR" refresh -no-color || true
+
+                                        echo "==> Writing outputs JSON to artifact (no console dump)"
+                                        terraform -chdir="$DB_DIR" output -json > post_apply_outputs.json || true
+
+                                        echo "==> Compact summary (engine versions & monitoring)"
+
+                                        summarize_db() {
+                                          local engine="$1" # mysql | mariadb
+                                          local id="${TS_ENV}-cylon-${engine}"
+                                          local out
+                                          if out=$(aws rds describe-db-instances \
+                                            --region "${AWS_REGION}" \
+                                            --db-instance-identifier "${id}" \
+                                            --query 'DBInstances[0].{EngineVersion:EngineVersion,MonitoringInterval:MonitoringInterval,MonitoringRoleArn:MonitoringRoleArn,Status:DBInstanceStatus}' \
+                                            --output json 2>/dev/null); then
+                                            local ver int arn status
+                                            ver=$(echo "$out" | jq -r '.EngineVersion // "<unknown>"')
+                                            int=$(echo "$out" | jq -r '.MonitoringInterval // 0')
+                                            arn=$(echo "$out" | jq -r '.MonitoringRoleArn // "<none>"')
+                                            status=$(echo "$out" | jq -r '.Status // "<unknown>"')
+                                            printf "%s: engine_version=%s, MonitoringInterval=%s, MonitoringRoleArn=%s, Status=%s\n" \
+                                              "${engine^}" "$ver" "$int" "$arn" "$status"
+                                          else
+                                            echo "WARN: failed to fetch describe-db-instances for ${id}"
+                                          fi
+                                        }
+
+                                        summarize_db mysql || true
+                                        summarize_db mariadb || true
+                                    '''
+                                    archiveArtifacts artifacts: 'post_apply_outputs.json', onlyIfSuccessful: true, allowEmptyArchive: true
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('Archive SSH Key') {
+                    when {
+                        allOf {
+                            expression { params.ACTION == "apply" }
+                            expression { params.CREATE_KEY }
+                            expression { params.TF_STACK?.trim() == "" || params.TF_STACK?.trim() == "compute" }
+                        }
+                    }
+                    steps {
+                        dir('infrastructure_cylon') {
+                            script {
+                                def pemPath = ".terraspace-cache/${env.DERIVED_AWS_REGION}/${params.ENVIRONMENT}/stacks/compute/${params.ENVIRONMENT}_id_rsa.pem"
+                                def archiveName = "cylon_${params.ENVIRONMENT}_id_rsa.pem"
+
+                                // Read via shell to avoid permission issues
+                                def privateKey = sh(
+                                    script: "cat ${pemPath}",
+                                    returnStdout: true
+                                ).trim()
+
+                                // Write to file in Jenkins workspace
+                                writeFile file: archiveName, text: privateKey
+
+                                // Set correct permissions
+                                sh "chmod 0400 ${archiveName}"
+
+                                // Verify file exists and has content
+                                def fileSize = sh(
+                                    script: "stat -c%s ${archiveName}",
+                                    returnStdout: true
+                                ).trim()
+                                echo "✅ PEM file size: ${fileSize} bytes"
+
+                                // Archive PEM
+                                archiveArtifacts artifacts: archiveName, onlyIfSuccessful: true
+                            }
+                        }
+                    }
+                }
+
+                stage('Retrieve EC2 SSH Info') {
+                    when {
+                        allOf {
+                            expression { params.ACTION == "apply" }
+                            expression { params.TF_STACK?.trim() == "" || params.TF_STACK?.trim() == "compute" }
+                        }
+                    }
+                    steps {
+                        dir('infrastructure_cylon') {
+                            script {
+                                withCredentials([[
+                                    $class: 'UsernamePasswordMultiBinding',
+                                    credentialsId: CREDS_ID,
+                                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                                ]]) {
+                                    withEnv(["PATH=/usr/local/bin:$PATH"]) {
+                                        echo "🔍 Terraform diagnostics"
+                                        sh "ls -l /usr/local/bin/terraform || true"
+                                        sh "which terraform || true"
+                                        sh "terraform version || true"
+
+                                        echo "📡 Getting instance connection info..."
+
+                                        // Get IP addresses and DNS via terraform output
+                                        sh """
+                                        cd .terraspace-cache/${env.DERIVED_AWS_REGION}/${params.ENVIRONMENT}/stacks/compute
+                                        terraform output -json > compute_output.json
+                                        """
+
+                                        // Parsing a JSON file
+                                        def outputs = readJSON(file: ".terraspace-cache/${env.DERIVED_AWS_REGION}/${params.ENVIRONMENT}/stacks/compute/compute_output.json")
+                                        def publicIps = outputs.instance_public_ips.value
+                                        def publicDns = outputs.instance_public_dns.value
+                                        def keyFile = "cylon_${params.ENVIRONMENT}_id_rsa.pem"
+
+                                        // Outputting info
+                                        for (int i = 0; i < publicIps.size(); i++) {
+                                            def ip = publicIps[i]
+                                            def dns = publicDns[i]
+
+                                            echo "🟢 Instance ${i + 1}"
+                                            echo "   ▸ Public IP  : ${ip}"
+                                            echo "   ▸ Public DNS : ${dns}"
+                                            echo "   ▸ SSH (IP)   : ssh -i ${keyFile} ubuntu@${ip}"
+                                            echo "   ▸ SSH (DNS)  : ssh -i ${keyFile} ubuntu@${dns}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    dir('infrastructure_cylon') {
+                        // Try fetching terraspace logs if available
+                        sh "terraspace logs -a || true"
+
+                        // Ensure Jenkins can access/cache files if needed
+                        sh "chmod -R u+rwX,g+rwX,o-rwx .terraspace-cache || true"
+
+                        // Clean up any sensitive PEM files just in case
+                        sh '''
+                            echo "🧹 Cleaning up sensitive PEM files from .terraspace-cache"
+                            find .terraspace-cache -type f -name "*.pem" -exec rm -f {} +
+                        '''
+                    }
+
+                    // Reassign ownership before workspace cleanup
+                    sh "chown -R ${userId}:${groupId} ."
+
+                    // Clean Jenkins workspace
+                    cleanWs()
+                }
+            }
+        }
+    }
+}

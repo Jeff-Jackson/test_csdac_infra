@@ -1,0 +1,40 @@
+pipeline {
+    agent {
+        label 'csdac-prod'
+    }
+    environment {
+        GIT_SOURCE_REPO = 'https://wwwin-github.cisco.com/ntd-identity/csdac_infra.git'
+        GIT_DEST_REPO = 'https://github.com/cisco-sbg/csdac-infra.git'
+        SRC_BRANCH = 'master'
+        DEST_BRANCH = 'main'
+    }
+    stages {
+        stage('Cleanup Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Mirror Git Branch') {
+            steps {
+                script {
+                    withCredentials([
+                        usernamePassword(credentialsId: 'muster-git-http', usernameVariable: 'SRC_LOGIN', passwordVariable: 'SRC_TOKEN'),
+                        usernamePassword(credentialsId: 'osmiichu-sbg-github-pat', usernameVariable: 'DEST_LOGIN', passwordVariable: 'DEST_TOKEN')
+                    ]) {
+                        sh '''
+                            echo "Cloning source_repo (only branch $SRC_BRANCH)..."
+                            GIT_SOURCE_AUTH="https://${SRC_LOGIN}:${SRC_TOKEN}@wwwin-github.cisco.com/ntd-identity/csdac_infra.git"
+                            git clone --single-branch --branch $SRC_BRANCH $GIT_SOURCE_AUTH repo || exit 1
+
+                            cd repo
+                            git remote add dest https://${DEST_LOGIN}:${DEST_TOKEN}@github.com/cisco-sbg/csdac-infra.git
+
+                            echo "Forcing push of branch $SRC_BRANCH to dest_repo as $DEST_BRANCH..."
+                            git push --force dest $SRC_BRANCH:$DEST_BRANCH || exit 1
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
