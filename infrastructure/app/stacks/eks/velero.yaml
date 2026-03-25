@@ -1,0 +1,88 @@
+upgradeCRDs: true
+
+# NOTE: Velero's upgradeCRDs hook job requires /bin/sh and `which`.
+# The `registry.k8s.io/kubectl` and `rancher/kubectl` images are minimal and do not include a shell,
+# so the hook will fail with "exec: /bin/sh: no such file".
+# Use Bitnami Legacy kubectl image for now (temporary migration), or mirror it into an internal registry.
+# Ref: vmware-tanzu/helm-charts issues about kubectl image + shell requirements.
+# IMPORTANT: The velero chart expects `kubectl.repository` / `kubectl.tag` (NOT `kubectl.image.*`).
+kubectl:
+  # Some chart templates use kubectl.repository/tag
+  repository: docker.io/bitnamilegacy/kubectl
+  tag: 1.26.14-debian-11-r6
+  pullPolicy: IfNotPresent
+
+  # Some chart templates use kubectl.image.repository/tag
+  image:
+    repository: docker.io/bitnamilegacy/kubectl
+    tag: 1.26.14-debian-11-r6
+    pullPolicy: IfNotPresent
+
+# Some chart templates use upgradeCRDsJob.kubectl.image.* for the hook job initContainer
+upgradeCRDsJob:
+  kubectl:
+    image:
+      repository: docker.io/bitnamilegacy/kubectl
+      tag: 1.26.14-debian-11-r6
+      pullPolicy: IfNotPresent
+
+crds:
+  install: true
+
+configuration:
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: "${VELERO_BUCKET}"
+      default: true
+      config:
+        region: "${VELERO_REGION}"
+        serverSideEncryption: AES256
+  volumeSnapshotLocation:
+    - provider: aws
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.2.0
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+
+dnsPolicy: ClusterFirst
+tolerations: []
+nodeSelector: {}
+schedules:
+  defaultdaily:
+    schedule: 0 5 * * *
+    template:
+      snapshotVolumes: false
+      ttl: 336h
+#metrics:
+#  enabled: true
+#  scrapeInterval: 30s
+#  scrapeTimeout: 10s
+#
+#  # service metdata if metrics are enabled
+#  service:
+#    annotations: {}
+#    labels: {}
+#
+#  # Pod annotations for Prometheus
+#  podAnnotations:
+#    prometheus.io/scrape: "true"
+#    prometheus.io/port: "8085"
+#    prometheus.io/path: "/metrics"
+#
+##  serviceMonitor:
+##    enabled: true
+##    additionalLabels:
+##      release: prom
