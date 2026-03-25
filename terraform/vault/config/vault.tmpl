@@ -1,0 +1,138 @@
+global:
+  enabled: true
+  tlsDisable: false
+  openshift: false
+  psp:
+    enable: false
+    annotations: |
+      seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default,runtime/default
+      apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
+      seccomp.security.alpha.kubernetes.io/defaultProfileName:  runtime/default
+      apparmor.security.beta.kubernetes.io/defaultProfileName:  runtime/default
+injector:
+  enabled: false
+server:
+  enabled: true
+  image:
+    repository: "hashicorp/vault"
+    tag: "1.18.1"
+    pullPolicy: IfNotPresent
+  updateStrategyType: "OnDelete"
+  authDelegator:
+    enabled: true
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204"
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true"
+    initialDelaySeconds: 60
+  preStopSleepSeconds: 5
+  extraEnvironmentVars:
+    VAULT_CACERT: /vault/userconfig/vault-server-tls/vault.ca
+#  auditStorage:
+#    enabled: true
+  standalone:
+    enabled: false
+  extraSecretEnvironmentVars: []
+  extraVolumes:
+  - type: secret
+    name: vault-server-tls
+  affinity: |
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ template "vault.name" . }}
+              app.kubernetes.io/instance: "{{ .Release.Name }}"
+              component: server
+          topologyKey: kubernetes.io/hostname
+  service:
+    enabled: true
+    externalTrafficPolicy: Cluster
+    port: 8200
+    targetPort: 8200
+    annotations: {}
+#  dataStorage:
+#    enabled: true
+#    size: 10Gi
+#    mountPath: "/vault/data"
+#    storageClass: null
+#    accessMode: ReadWriteOnce
+#    annotations: {}
+  ha:
+    enabled: true
+    replicas: 3
+    apiAddr: null
+    raft:
+      enabled: false
+    config: |
+      ui = true
+      listener "tcp" {
+        address = "[::]:8200"
+        cluster_address = "[::]:8201"
+        tls_cert_file = "/vault/userconfig/vault-server-tls/vault.crt"
+        tls_key_file  = "/vault/userconfig/vault-server-tls/vault.key"
+        tls_client_ca_file = "/vault/userconfig/vault-server-tls/vault.ca"
+      }
+      service_registration "kubernetes" {}
+      seal "awskms" {
+        kms_key_id  = "${kms_key_id}"
+        region      = "${aws_region}"
+        role_arn    = "${role_arn}"
+      }
+      storage "dynamodb" {
+        ha_enabled              = "true"
+        region                  = "${aws_region}"
+        table                   = "${dynamodb_table}"
+        role_arn                = "${role_arn}"
+        web_identity_token_file = "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"
+      }
+    disruptionBudget:
+      enabled: true
+      maxUnavailable: null
+  serviceAccount:
+    create: true
+    name: "vault-server-sa"
+    annotations:
+      "eks.amazonaws.com/role-arn": "${role_arn}"
+  statefulSet:
+    annotations: {}
+csi:
+  enabled: true
+  image:
+    repository: "hashicorp/vault-csi-provider"
+    tag: "1.5.0"
+    pullPolicy: IfNotPresent
+  volumes:
+  - name: tls
+    secret:
+      secretName: vault-server-tls
+      items:
+      - key: vault.ca
+        path: vault.ca
+  volumeMounts:
+  - name: tls
+    mountPath: "/vault/tls"
+    readOnly: true
+  resources: {}
+  daemonSet:
+    updateStrategy:
+      type: RollingUpdate
+      maxUnavailable: ""
+    annotations: {}
+    providersDir: "/etc/kubernetes/secrets-store-csi-providers"
+    kubeletRootDir: "/var/lib/kubelet"
+#  readinessProbe:
+#    failureThreshold: 2
+#    initialDelaySeconds: 5
+#    periodSeconds: 5
+#    successThreshold: 1
+#    timeoutSeconds: 3
+#  livenessProbe:
+#    failureThreshold: 2
+#    initialDelaySeconds: 5
+#    periodSeconds: 5
+#    successThreshold: 1
+#    timeoutSeconds: 3
+  debug: true
