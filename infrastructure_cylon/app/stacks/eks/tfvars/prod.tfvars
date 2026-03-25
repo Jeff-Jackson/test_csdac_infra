@@ -1,0 +1,6 @@
+cluster_version = "1.29"
+eks_ami = "1.29.6-20240828"
+eks_capacity_type = "ON_DEMAND"
+eks_node_desired = "3"
+eks_node_max = "10"
+eks_node_min = "3"

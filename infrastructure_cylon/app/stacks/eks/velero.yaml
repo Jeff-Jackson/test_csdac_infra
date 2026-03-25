@@ -1,0 +1,45 @@
+resources:
+  requests:
+    cpu: 500m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.2.0
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+
+dnsPolicy: ClusterFirst
+tolerations: []
+nodeSelector: {}
+schedules:
+  defaultdaily:
+    schedule: 0 5 * * *
+    template:
+      snapshotVolumes: false
+      ttl: 336h
+#metrics:
+#  enabled: true
+#  scrapeInterval: 30s
+#  scrapeTimeout: 10s
+#
+#  # service metdata if metrics are enabled
+#  service:
+#    annotations: {}
+#    labels: {}
+#
+#  # Pod annotations for Prometheus
+#  podAnnotations:
+#    prometheus.io/scrape: "true"
+#    prometheus.io/port: "8085"
+#    prometheus.io/path: "/metrics"
+#
+##  serviceMonitor:
+##    enabled: true
+##    additionalLabels:
+##      release: prom

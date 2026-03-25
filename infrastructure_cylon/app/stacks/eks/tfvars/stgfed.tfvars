@@ -1,0 +1,10 @@
+cluster_version = "1.29"
+eks_capacity_type = "SPOT"
+eks_node_desired = "3"
+eks_node_max = "5"
+eks_node_min = "3"
+eks_ami = "ami-061b9e740e6c6e0aa"
+eks_ami_type = "CUSTOM"
+user_data = true
+eks_instance_type = "c5n.4xlarge"
+arn_type = "aws-us-gov"
